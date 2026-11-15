@@ -3,8 +3,11 @@ import os
 import subprocess
 import argparse
 import json
+import platform
+import shutil
 import traceback
 import webbrowser
+from functools import wraps
 from pathlib import Path
 from datetime import datetime
 from PySide6.QtWidgets import (
@@ -16,7 +19,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import (
     QAction, QShortcut, QKeySequence, QTextCursor, QIcon, QPixmap, QFont, QDesktopServices
 )
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QThread, QTimer, QUrl
 
 # Import external logic functions
 from sammie import sammie
@@ -28,6 +31,8 @@ from sammie.export_image_dialog import ImageExportDialog
 from sammie.export_dialog import ExportDialog
 from sammie.settings_dialog import SettingsDialog
 from sammie.settings_manager import get_settings_manager, initialize_settings, ApplicationSettings
+from sammie.performance_monitor import PerformanceMonitorWindow
+from sammie.performance_trace import trace_performance_call
 
 # Import GUI widgets
 from sammie.gui_widgets import (
@@ -39,6 +44,43 @@ from sammie.gui_widgets import (
 # ==================== VERSION ====================
 
 __version__ = "2.5.0"
+
+
+def monitored_operation(name):
+    """Mark a synchronous MainWindow action for the performance monitor."""
+    def decorator(function):
+        @wraps(function)
+        def wrapper(self, *args, **kwargs):
+            self._begin_operation(name)
+            try:
+                return function(self, *args, **kwargs)
+            finally:
+                self._end_operation()
+        return wrapper
+    return decorator
+
+
+class SegmentationModelLoadWorker(QThread):
+    """Load and initialize an MLX model without blocking Qt's event loop."""
+
+    def __init__(self, manager, model_name, parent=None):
+        super().__init__(parent)
+        self.manager = manager
+        self.model_name = model_name
+        self.succeeded = False
+        self.error = None
+
+    def run(self):
+        try:
+            self.manager.unload_segmentation_model()
+            self.succeeded = self.manager.load_segmentation_model(
+                self.model_name, parent_window=None
+            )
+            if self.succeeded:
+                self.manager.initialize_predictor()
+        except Exception as error:
+            self.error = error
+            self.succeeded = False
 
 # ==================== LOGGING HELPER ====================
 
@@ -112,6 +154,14 @@ class SegmentationTab(QWidget):
         self.object_spinbox.setValue(0)
         self.object_spinbox.setToolTip("Select which object ID to assign to new points. Each object gets a unique color.")
         object_row.addWidget(self.object_spinbox)
+
+        self.new_object_btn = QPushButton("New Object")
+        self.new_object_btn.setToolTip(
+            "Select the next unused object ID. Use a separate object for each "
+            "person, vehicle, or item you want to track."
+        )
+        self.new_object_btn.clicked.connect(self._select_new_object)
+        object_row.addWidget(self.new_object_btn)
         
         # Color display widget
         self.color_display = ColorDisplayWidget(core.PALETTE[0])
@@ -135,6 +185,7 @@ class SegmentationTab(QWidget):
         # Connect signals
         self.object_spinbox.valueChanged.connect(self._update_color_display)
         self.object_spinbox.valueChanged.connect(self._update_name_display)
+        self.object_spinbox.valueChanged.connect(self._save_selected_object_id)
         self.object_name_input.textChanged.connect(self._save_object_name)
         
         # Load initial name
@@ -167,8 +218,14 @@ class SegmentationTab(QWidget):
         settings_mgr.get_session_setting("default_sam_model", "Base")
 
         self.sam_model_combo = QComboBox()
-        self.sam_model_combo.addItems(["Base", "Large", "Efficient", "Anime"])
-        self.sam_model_combo.setToolTip("Large model is slower but slightly more accurate.\nEfficient model is faster but less accurate.")
+        model_choices = ["Base", "Anime"]
+        if platform.system() == "Darwin" and platform.machine() == "arm64":
+            model_choices[0:0] = ["Base+ MLX FP16", "SAM 3.1 MLX"]
+        self.sam_model_combo.addItems(model_choices)
+        self.sam_model_combo.setToolTip(
+            "Base+ MLX FP16 uses native Apple Silicon execution at 1024px.\n"
+            "SAM 3.1 MLX uses 1008px Object Multiplex tracking."
+        )
         self.sam_model_btn = QPushButton("Load Model")
         self.sam_model_btn.setEnabled(False) # disabled until video is loaded
 
@@ -266,10 +323,10 @@ class SegmentationTab(QWidget):
         
         settings_mgr = get_settings_manager()
         slider_configs = [
-            ("Remove Holes:", 0, 50, 0, settings_mgr.get_session_setting("holes", 0), "holes",
-            "Remove small holes inside segmented objects."),
-            ("Remove Dots:", 0, 50, 0, settings_mgr.get_session_setting("dots", 0), "dots",
-            "Remove small isolated regions outside main objects."),
+            ("Remove Holes:", 0, 200, 0, settings_mgr.get_session_setting("holes", 0), "holes",
+            "Fill enclosed holes up to strength² pixels (for example, 120 fills holes up to 14,400 px)."),
+            ("Remove Dots:", 0, 200, 0, settings_mgr.get_session_setting("dots", 0), "dots",
+            "Remove isolated regions up to strength² pixels while preserving retained edge opacity."),
             ("Border Fix:", 0, 10, 0, settings_mgr.get_session_setting("border_fix", 0), "border_fix",
             "Fix artifacts at the edge of the frame by extending masks towards the edge."),
             ("Shrink/Grow:", -20, 20, 0, settings_mgr.get_session_setting("grow", 0), "grow",
@@ -289,16 +346,23 @@ class SegmentationTab(QWidget):
             slider.setToolTip(tooltip)
             sliders_layout.addWidget(slider, i, 1)
             
-            # Create value display
-            value_label = QLabel(str(current_val))
-            value_label.setMinimumWidth(30)
-            value_label.setAlignment(Qt.AlignCenter)
-            sliders_layout.addWidget(value_label, i, 2)
+            # Allow exact entry as well as quick slider adjustment. This is
+            # especially important for large masks where a few strength units
+            # represent thousands of pixels of cleanup area.
+            value_control = QSpinBox()
+            value_control.setRange(min_val, max_val)
+            value_control.setValue(current_val)
+            value_control.setMinimumWidth(64)
+            value_control.setToolTip(tooltip)
+            sliders_layout.addWidget(value_control, i, 2)
             
-            # Connect slider to value display and save settings
+            # Keep both controls synchronized. Saving and live rendering remain
+            # attached to the slider, so changing the number follows the exact
+            # same processing path as dragging.
             slider.valueChanged.connect(
-                lambda v, lbl=value_label: lbl.setText(str(v))
+                lambda v, control=value_control: control.setValue(v)
             )
+            value_control.valueChanged.connect(slider.setValue)
             slider.valueChanged.connect(
                 lambda v, key=attr_prefix: self._save_slider_value(key, v)
             )
@@ -310,7 +374,7 @@ class SegmentationTab(QWidget):
             
             # Store references
             setattr(self, f"{attr_prefix}_slider", slider)
-            setattr(self, f"{attr_prefix}_value", value_label)
+            setattr(self, f"{attr_prefix}_value", value_control)
         
         layout.addWidget(sliders_group)
     
@@ -331,6 +395,33 @@ class SegmentationTab(QWidget):
     def get_selected_object_id(self):
         """Get the currently selected object ID"""
         return self.object_spinbox.value()
+
+    def _select_new_object(self):
+        """Select an unused object ID so separate subjects cannot be merged accidentally."""
+        points = []
+        parent_window = getattr(self, 'parent_window', None)
+        point_manager = getattr(parent_window, 'point_manager', None)
+        if point_manager is not None:
+            points = point_manager.get_all_points()
+
+        object_id = core.next_available_object_id(
+            points, maximum=self.object_spinbox.maximum()
+        )
+        if object_id is None:
+            show_message_dialog(
+                parent_window,
+                "No object IDs available",
+                "All object IDs are already in use. Clear an object before adding another.",
+                type="warning",
+            )
+            return
+
+        self.object_spinbox.setValue(object_id)
+        self.object_name_input.setFocus()
+        print(
+            f"Selected new object {object_id}. Add points only on that subject; "
+            "use another object ID for a different subject."
+        )
     
     def _update_name_display(self, object_id):
         """Update the name input field when object ID changes"""
@@ -338,6 +429,10 @@ class SegmentationTab(QWidget):
         object_names = settings_mgr.get_session_setting("object_names", {})
         current_name = object_names.get(str(object_id), "")
         self.object_name_input.setText(current_name)
+
+    def _save_selected_object_id(self, object_id):
+        """Remember the active object so reopening cannot redirect new clicks to ID 0."""
+        get_settings_manager().set_session_setting("selected_object_id", object_id)
 
     def _save_object_name(self, name):
         """Save object name to session settings"""
@@ -383,21 +478,20 @@ class SegmentationTab(QWidget):
         """Load all values from settings (useful when loading a session)"""
         settings_mgr = get_settings_manager()
         
-        # Update object spinbox
-        self.object_spinbox.setValue(0)
+        # Restore the selected object instead of silently falling back to 0;
+        # losing this selection made it easy to add another subject to the
+        # wrong object after reopening a session.
+        selected_object_id = settings_mgr.get_session_setting("selected_object_id", 0)
+        self.object_spinbox.setValue(selected_object_id)
         
-        # Update object name
-        self._update_name_display(0)
+        # Update the name for the restored object, not object 0.
+        self._update_name_display(selected_object_id)
         
         model = settings_mgr.get_session_setting("sam_model", "Base")
-        if model == "Base":
-            self.sam_model_combo.setCurrentIndex(0)
-        elif model == "Large":
-            self.sam_model_combo.setCurrentIndex(1)
-        elif model == "Efficient":
-            self.sam_model_combo.setCurrentIndex(2)
-        elif model == "Anime":
-            self.sam_model_combo.setCurrentIndex(3)
+        if model == "Large":
+            model = "SAM 3.1 MLX"
+        model_index = self.sam_model_combo.findText(model)
+        self.sam_model_combo.setCurrentIndex(model_index if model_index >= 0 else 0)
 
         # Update sliders
         slider_mappings = [
@@ -407,10 +501,10 @@ class SegmentationTab(QWidget):
             ("grow", self.grow_slider, self.grow_value)
         ]
         
-        for setting_key, slider, value_label in slider_mappings:
+        for setting_key, slider, value_control in slider_mappings:
             value = settings_mgr.get_session_setting(setting_key, 0)
             slider.setValue(value)
-            value_label.setText(str(value))
+            value_control.setValue(value)
 
 class MattingTab(QWidget):
     """Tab containing matting controls and parameters"""
@@ -436,6 +530,21 @@ class MattingTab(QWidget):
         self.clear_matting_btn = QPushButton("Clear Matting")
         self.clear_matting_btn.setToolTip("Remove all matting data")
         matting_layout.addWidget(self.clear_matting_btn)
+        self.unload_segmentation_btn = QPushButton(
+            "Unload SAM to Free Memory"
+        )
+        self.unload_segmentation_btn.setToolTip(
+            "Release the loaded SAM model and its live tracking state before "
+            "matting. Saved points and mask files are kept. Return to the "
+            "Segmentation tab and press Load Model to continue editing."
+        )
+        matting_layout.addWidget(self.unload_segmentation_btn)
+        self.unload_segmentation_help = QLabel(
+            "Frees unified memory for matting. Your points and saved masks "
+            "are kept."
+        )
+        self.unload_segmentation_help.setWordWrap(True)
+        matting_layout.addWidget(self.unload_segmentation_help)
         layout.addWidget(matting_group)
         
         # MatAnyone Processing settings
@@ -1121,6 +1230,22 @@ class MainWindow(QMainWindow):
         self.is_playing = False
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self.play_next_frame)
+        # Frame rendering reads and composites full-resolution images. Coalesce
+        # rapid slider changes so scrubbing renders the newest requested frame
+        # instead of blocking the event loop on frames the user has passed.
+        self._pending_frame_render = None
+        self._frame_render_timer = QTimer(self)
+        self._frame_render_timer.setSingleShot(True)
+        self._frame_render_timer.setInterval(12)
+        self._frame_render_timer.timeout.connect(self._render_pending_frame)
+
+        # Console output can be extremely chatty during inference. Buffer GUI
+        # updates briefly; the complete unbounded log remains on disk.
+        self._pending_console_output = []
+        self._console_flush_timer = QTimer(self)
+        self._console_flush_timer.setSingleShot(True)
+        self._console_flush_timer.setInterval(33)
+        self._console_flush_timer.timeout.connect(self._flush_console_output)
         self.sam_manager = sammie.SamManager()
         self.matany_manager = matting.create_matting_manager()
         self.removal_manager = removal.RemovalManager()
@@ -1144,6 +1269,8 @@ class MainWindow(QMainWindow):
 
         # Initialize UI
         self._init_ui()
+        self.performance_monitor = PerformanceMonitorWindow(self)
+        self.performance_monitor.hide()
         self._connect_signals()
         self._setup_hotkeys()
         self._update_point_editing_state()
@@ -1279,6 +1406,9 @@ class MainWindow(QMainWindow):
             # Connect matting tab buttons
             matting_tab.run_matting_btn.clicked.connect(self.run_matting)
             matting_tab.clear_matting_btn.clicked.connect(self.clear_matting)
+            matting_tab.unload_segmentation_btn.clicked.connect(
+                self.unload_segmentation_for_matting
+            )
 
             # Connect postprocessing tab sliders
             matting_tab.shrink_grow_slider.valueChanged.connect(lambda _: self._update_current_frame_display())
@@ -1351,6 +1481,8 @@ class MainWindow(QMainWindow):
             ("200% Zoom", self.zoom_200),
             ("400% Zoom", self.zoom_400),
             (None, None),  # Separator
+            ("Performance Monitor", self.show_performance_monitor),
+            (None, None),  # Separator
             ("Reset Interface", self.reset_interface)
         ]
         
@@ -1405,15 +1537,16 @@ class MainWindow(QMainWindow):
         
         # vertical splitter between viewer and bottom panels
         self.vertical_splitter = QSplitter(Qt.Vertical)
+        self.vertical_splitter.setHandleWidth(6)
         
         # Center panel with image viewer and controls
-        center_panel = self._create_center_panel()
+        self.center_panel = self._create_center_panel()
         
         # Bottom panel
         bottom_panel = self._create_bottom_panel()
         
         # Setup vertical splitter
-        self.vertical_splitter.addWidget(center_panel)
+        self.vertical_splitter.addWidget(self.center_panel)
         self.vertical_splitter.addWidget(bottom_panel)
         self.vertical_splitter.setSizes(self.settings_mgr.app_settings.vertical_splitter_sizes)
         self.vertical_splitter.setCollapsible(0, False)
@@ -1481,6 +1614,7 @@ class MainWindow(QMainWindow):
         """Create the bottom panel with side-by-side layout"""
         # Create a horizontal splitter for side-by-side layout
         self.bottom_splitter = QSplitter(Qt.Horizontal)
+        self.bottom_splitter.setHandleWidth(6)
         self.bottom_splitter.setMinimumHeight(100)
         
         # Create containers for each panel
@@ -1488,8 +1622,8 @@ class MainWindow(QMainWindow):
         point_layout = QVBoxLayout(point_container)
         point_layout.setContentsMargins(2, 2, 2, 2)
         
-        console_container = QWidget()
-        console_layout = QVBoxLayout(console_container)
+        self.console_container = QWidget()
+        console_layout = QVBoxLayout(self.console_container)
         console_layout.setContentsMargins(2, 2, 2, 2)
         
         # Add labels to identify each panel
@@ -1521,6 +1655,24 @@ class MainWindow(QMainWindow):
         self.show_all_points_btn.clicked.connect(self._toggle_show_all_points)
         point_header_layout.addStretch()  # Push button to the right
         point_header_layout.addWidget(self.show_all_points_btn)
+
+        self.delete_selected_points_btn = QPushButton("Delete Selected")
+        self.delete_selected_points_btn.setEnabled(False)
+        self.delete_selected_points_btn.setToolTip(
+            "Delete every selected point (Delete key). Use Shift-click for a "
+            "range or Command-click on macOS / Ctrl-click elsewhere for "
+            "separate rows."
+        )
+        self.delete_selected_points_btn.clicked.connect(self.delete_selected_point)
+        point_header_layout.addWidget(self.delete_selected_points_btn)
+
+        self.expand_point_list_btn = QPushButton("Expand")
+        self.expand_point_list_btn.setCheckable(True)
+        self.expand_point_list_btn.setToolTip(
+            "Expand the point list to fill the workspace; click Restore to return."
+        )
+        self.expand_point_list_btn.toggled.connect(self._toggle_point_list_expanded)
+        point_header_layout.addWidget(self.expand_point_list_btn)
         point_layout.addLayout(point_header_layout)
         
         # Point table
@@ -1530,10 +1682,16 @@ class MainWindow(QMainWindow):
         self.point_table.set_current_frame(self.frame_slider.value())
         point_layout.addWidget(self.point_table)
         self.point_table.point_selected.connect(self._on_point_selected)
+        self.point_table.selection_count_changed.connect(
+            self._update_delete_selected_points_button
+        )
         
         # Console
         self.console = QTextEdit()
         self.console.setReadOnly(True)
+        # QTextEdit otherwise retains every progress line for the lifetime of
+        # the process. Keep a generous diagnostic window without unbounded RAM.
+        self.console.document().setMaximumBlockCount(5000)
         console_layout.addWidget(self.console)
         
         console_font = QFont("Consolas")  # Try Consolas first
@@ -1542,7 +1700,7 @@ class MainWindow(QMainWindow):
         
         # Add containers to splitter
         self.bottom_splitter.addWidget(point_container)
-        self.bottom_splitter.addWidget(console_container)
+        self.bottom_splitter.addWidget(self.console_container)
         
         self.bottom_splitter.setSizes(self.settings_mgr.app_settings.bottom_splitter_sizes)
         
@@ -1551,6 +1709,42 @@ class MainWindow(QMainWindow):
         self.bottom_splitter.setCollapsible(1, True)
         
         return self.bottom_splitter
+
+    def _update_delete_selected_points_button(self, count):
+        """Keep the bulk-delete action in sync with the table selection."""
+        if not hasattr(self, "delete_selected_points_btn"):
+            return
+        self.delete_selected_points_btn.setEnabled(count > 0)
+        label = "Delete Selected" if count == 0 else f"Delete Selected ({count})"
+        self.delete_selected_points_btn.setText(label)
+
+    def _toggle_point_list_expanded(self, expanded):
+        """Maximize the point list while preserving the user's splitter layout."""
+        if expanded:
+            self._point_list_restore_vertical_sizes = self.vertical_splitter.sizes()
+            self._point_list_restore_bottom_sizes = self.bottom_splitter.sizes()
+            self.center_panel.hide()
+            self.console_container.hide()
+            self.expand_point_list_btn.setText("Restore")
+            self.expand_point_list_btn.setToolTip(
+                "Restore the viewer, console, and previous panel sizes."
+            )
+            return
+
+        self.center_panel.show()
+        self.console_container.show()
+        self.expand_point_list_btn.setText("Expand")
+        self.expand_point_list_btn.setToolTip(
+            "Expand the point list to fill the workspace; click Restore to return."
+        )
+        vertical_sizes = getattr(
+            self, "_point_list_restore_vertical_sizes", None
+        )
+        bottom_sizes = getattr(self, "_point_list_restore_bottom_sizes", None)
+        if vertical_sizes:
+            self.vertical_splitter.setSizes(vertical_sizes)
+        if bottom_sizes:
+            self.bottom_splitter.setSizes(bottom_sizes)
     
     def _create_frame_controls(self, layout):
         """Create frame navigation controls"""
@@ -1746,7 +1940,33 @@ class MainWindow(QMainWindow):
         self.status = QLabel("Ready")
         self.statusBar = QStatusBar()
         self.statusBar.addWidget(self.status)
+        self.performance_monitor_btn = QPushButton("Performance Monitor")
+        self.performance_monitor_btn.setToolTip(
+            "Open live CPU, unified-memory, swap, MLX, and PyTorch MPS statistics"
+        )
+        self.performance_monitor_btn.clicked.connect(self.show_performance_monitor)
+        self.statusBar.addPermanentWidget(self.performance_monitor_btn)
         self.setStatusBar(self.statusBar)
+
+    def show_performance_monitor(self):
+        """Show and focus the reusable performance-monitor mini window."""
+        monitor = getattr(self, "performance_monitor", None)
+        if monitor is None:
+            return
+        # show() alone does not restore a minimized top-level Qt window.
+        monitor.showNormal()
+        monitor.raise_()
+        monitor.activateWindow()
+
+    def _begin_operation(self, name):
+        monitor = getattr(self, "performance_monitor", None)
+        if monitor is not None:
+            monitor.begin_operation(name)
+
+    def _end_operation(self):
+        monitor = getattr(self, "performance_monitor", None)
+        if monitor is not None:
+            monitor.end_operation()
 
     def _setup_console_redirect(self):
         """Setup console redirection to the console tab"""
@@ -1759,17 +1979,38 @@ class MainWindow(QMainWindow):
     # ==================== EVENT HANDLERS AND CALLBACKS ====================
     
     def append_to_console(self, text, is_carriage_return=False):
-        cursor = self.console.textCursor()
+        """Queue console text so bursts cause one document update per UI tick."""
+        self._pending_console_output.append((text, is_carriage_return))
+        if not self._console_flush_timer.isActive():
+            self._console_flush_timer.start()
 
-        if is_carriage_return:
+    def _flush_console_output(self):
+        """Apply queued console output in one cursor transaction."""
+        if not self._pending_console_output:
+            return
+
+        pending = self._pending_console_output
+        self._pending_console_output = []
+        cursor = self.console.textCursor()
+        normal_chunks = []
+
+        def flush_normal_chunks():
+            if normal_chunks:
+                cursor.movePosition(QTextCursor.End)
+                cursor.insertText("".join(normal_chunks))
+                normal_chunks.clear()
+
+        for text, is_carriage_return in pending:
+            if not is_carriage_return:
+                normal_chunks.append(text)
+                continue
+            flush_normal_chunks()
             cursor.movePosition(QTextCursor.End)
             cursor.movePosition(QTextCursor.StartOfBlock, QTextCursor.MoveAnchor)
             cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
             cursor.removeSelectedText()
             cursor.insertText(text.strip())
-        else:
-            cursor.movePosition(QTextCursor.End)
-            cursor.insertText(text)
+        flush_normal_chunks()
 
         self.console.setTextCursor(cursor)
         self.console.ensureCursorVisible()
@@ -1790,8 +2031,19 @@ class MainWindow(QMainWindow):
             self.point_table.set_current_frame(current_frame)
             self._refresh_table()
         
+        self._pending_frame_render = current_frame
+        self._frame_render_timer.start()
+
+    def _render_pending_frame(self):
+        """Render only the newest frame requested while scrubbing/playback."""
+        if self._pending_frame_render is None or core.VideoInfo.total_frames == 0:
+            return
+        current_frame = self.frame_slider.value()
+        self._pending_frame_render = None
         view_options = self.get_view_options()
-        updated_image = sammie.update_image(current_frame, view_options, self.point_manager.points)
+        updated_image = sammie.update_image(
+            current_frame, view_options, self.point_manager.points
+        )
         if updated_image:
             self.viewer.update_image(updated_image)
     
@@ -1972,10 +2224,19 @@ class MainWindow(QMainWindow):
         """Update the current frame display with masks and points"""
         if core.VideoInfo.total_frames == 0:
             return  # Don't try to update before video is loaded
+        # Explicit refreshes (point edits, view changes, previews) must display
+        # immediately and supersede a deferred slider render.
+        self._frame_render_timer.stop()
+        self._pending_frame_render = None
         current_frame = self.frame_slider.value()
         view_options = self.get_view_options()
         preview_object_id = self.sidebar.segmentation_tab.get_selected_object_id() if preview_mask is not None else None
-        updated_image = sammie.update_image(current_frame, view_options, self.point_manager.points, preview_mask=preview_mask, preview_object_id=preview_object_id)
+        with trace_performance_call(
+                "ui.render_frame", device="cpu", frame=current_frame,
+                preview=preview_mask is not None):
+            updated_image = sammie.update_image(
+                current_frame, view_options, self.point_manager.points,
+                preview_mask=preview_mask, preview_object_id=preview_object_id)
         if updated_image:
             self.viewer.update_image(updated_image)
             
@@ -1996,17 +2257,110 @@ class MainWindow(QMainWindow):
             elif show_all_points:
                 self.point_table.add_point(point['frame'], point['object_id'], point['positive'], point['x'], point['y'])
 
+    @staticmethod
+    def _format_storage_size(byte_count):
+        """Return a compact human-readable size for the close confirmation."""
+        size = float(byte_count)
+        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+            if size < 1024 or unit == "TiB":
+                return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+            size /= 1024
+
+    def _temporary_project_usage(self):
+        """Return (file count, bytes) for the resumable temporary project."""
+        temp_path = Path(core.temp_dir)
+        if not temp_path.is_dir():
+            return 0, 0
+
+        file_count = 0
+        total_bytes = 0
+        for path in temp_path.rglob("*"):
+            if not path.is_file():
+                continue
+            file_count += 1
+            try:
+                total_bytes += path.stat().st_size
+            except OSError:
+                pass
+        return file_count, total_bytes
+
+    def _ask_about_temporary_project(self):
+        """Return 'delete', 'keep', or 'cancel' when extracted frames exist."""
+        frames_path = Path(core.frames_dir)
+        if not frames_path.is_dir() or not any(frames_path.iterdir()):
+            return "keep"
+
+        file_count, total_bytes = self._temporary_project_usage()
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Warning)
+        message.setWindowTitle("Temporary Project Files")
+        message.setText("Delete temporary project files before closing?")
+        message.setInformativeText(
+            f"Sammie's temporary project currently uses "
+            f"{self._format_storage_size(total_bytes)} across "
+            f"{file_count:,} files.\n\n"
+            "Deleting frees the space, but this session cannot be resumed. "
+            "Extracted frames, masks, mattes, removal results, and saved point "
+            "state in the temp folder will be permanently removed. Your original "
+            "video and exported files will not be deleted."
+        )
+        delete_button = message.addButton(
+            "Delete Temporary Files", QMessageBox.DestructiveRole
+        )
+        keep_button = message.addButton("Keep Files", QMessageBox.AcceptRole)
+        cancel_button = message.addButton(QMessageBox.Cancel)
+        message.setDefaultButton(keep_button)
+        message.exec()
+
+        clicked = message.clickedButton()
+        if clicked is delete_button:
+            return "delete"
+        if clicked is cancel_button:
+            return "cancel"
+        return "keep"
+
+    def _delete_temporary_project(self):
+        """Delete only this checkout's known temp directory."""
+        project_root = Path(__file__).resolve().parent
+        temp_path = Path(core.temp_dir).resolve()
+        expected_temp_path = (project_root / "temp").resolve()
+        if temp_path != expected_temp_path:
+            raise RuntimeError(f"Refusing to delete unexpected temp path: {temp_path}")
+
+        self.sam_manager.unload_segmentation_model()
+        if temp_path.exists():
+            shutil.rmtree(temp_path)
+
     def closeEvent(self, event):
-        """Clean up on close"""
-        # Save current session state
-        self._save_current_ui_state()
-        self.settings_mgr.save_points(self.point_manager.get_all_points())
-        self.settings_mgr.save_session_settings()
-        
+        """Save or remove the resumable temporary project, then close."""
+        cleanup_choice = self._ask_about_temporary_project()
+        if cleanup_choice == "cancel":
+            event.ignore()
+            return
+
         self._save_window_and_splitter_settings()
 
-        # Clean up console redirect
+        if cleanup_choice == "delete":
+            try:
+                self._delete_temporary_project()
+            except Exception as error:
+                QMessageBox.critical(
+                    self,
+                    "Could Not Delete Temporary Files",
+                    f"Sammie could not remove its temporary project:\n\n{error}",
+                )
+                event.ignore()
+                return
+        else:
+            self._save_current_ui_state()
+            self.settings_mgr.save_points(self.point_manager.get_all_points())
+            self.settings_mgr.save_session_settings()
+
+        if hasattr(self, "performance_monitor"):
+            self.performance_monitor.shutdown()
         if hasattr(self, 'console_redirect'):
+            self._console_flush_timer.stop()
+            self._flush_console_output()
             self.console_redirect.close()
         event.accept()
 
@@ -2055,10 +2409,9 @@ class MainWindow(QMainWindow):
         self._update_current_frame_display()
         
     def delete_selected_point(self):
-        """Delete the currently selected point in the table"""
+        """Delete every selected point in the table."""
         if hasattr(self, 'point_table'):
-            row = self.point_table.selectionModel().currentIndex().row()
-            self.point_table.delete_selected_row(single_row=row)
+            self.point_table.delete_selected_row()
 
     def replay_all_points(self):
         """Replay all points to rebuild masks"""
@@ -2166,11 +2519,43 @@ class MainWindow(QMainWindow):
             print("Model is already loaded")
             return
 
+        if model == "SAM 3.1 MLX":
+            active_worker = getattr(self, "_segmentation_load_worker", None)
+            if active_worker is not None and active_worker.isRunning():
+                print("A segmentation model is already loading")
+                return
+            if not sammie.sam31_checkpoint_ready():
+                show_message_dialog(
+                    self,
+                    title="SAM 3.1 checkpoint missing",
+                    message="Download mlx-community/sam3.1-bf16 into "
+                            "checkpoints/sam3.1-mlx-bf16 first.",
+                    type="error",
+                )
+                return
+
+            self._segmentation_load_progress = QProgressDialog(
+                "Loading SAM 3.1 MLX...", None, 0, 0, self
+            )
+            self._segmentation_load_progress.setWindowTitle("Please Wait")
+            self._segmentation_load_progress.setModal(True)
+            self._segmentation_load_progress.show()
+            self.segmentation_tab.sam_model_btn.setEnabled(False)
+            self._begin_operation("Loading SAM 3.1 MLX")
+            worker = SegmentationModelLoadWorker(
+                self.sam_manager, model, parent=self
+            )
+            self._segmentation_load_worker = worker
+            worker.finished.connect(self._finish_segmentation_model_load)
+            worker.start()
+            return
+
         progress = QProgressDialog("Loading...", None, 0, 0, self)
         progress.setWindowTitle("Please Wait")
         progress.setModal(True)
         progress.show()
         QApplication.processEvents()
+        self._begin_operation(f"Loading {model}")
 
         self.sam_manager.unload_segmentation_model()
         QApplication.processEvents()
@@ -2179,11 +2564,51 @@ class MainWindow(QMainWindow):
             settings_mgr = get_settings_manager()
             settings_mgr.set_session_setting("sam_model", model)
             settings_mgr.set_app_setting("default_sam_model", model)
+            self._mark_segmentation_model_loaded()
         else:
             print("Failed to load segmentation model")
 
         progress.close()
+        self._end_operation()
 
+    def _finish_segmentation_model_load(self):
+        """Finish the background SAM 3.1 load on Qt's main thread."""
+        worker = self._segmentation_load_worker
+        progress = self._segmentation_load_progress
+        progress.close()
+        self.segmentation_tab.sam_model_btn.setEnabled(True)
+
+        if worker.succeeded:
+            model = worker.model_name
+            settings_mgr = get_settings_manager()
+            settings_mgr.set_session_setting("sam_model", model)
+            settings_mgr.set_app_setting("default_sam_model", model)
+            self._mark_segmentation_model_loaded()
+            print(f"{model} is ready")
+        else:
+            message = str(worker.error) if worker.error else "Unknown loading error"
+            print(f"Failed to load segmentation model: {message}")
+            show_message_dialog(
+                self,
+                title="Could Not Load SAM 3.1",
+                message=message,
+                type="error",
+            )
+
+        worker.deleteLater()
+        self._segmentation_load_worker = None
+        self._segmentation_load_progress = None
+        self._end_operation()
+
+    def _mark_segmentation_model_loaded(self):
+        """Restore the Matting-tab memory control after SAM is loaded."""
+        if hasattr(self, "matting_tab"):
+            self.matting_tab.unload_segmentation_btn.setEnabled(True)
+            self.matting_tab.unload_segmentation_btn.setText(
+                "Unload SAM to Free Memory"
+            )
+
+    @monitored_operation("Tracking all frames")
     def track_objects(self):
         """Run object tracking using current points"""
         self.settings_mgr.save_session_settings()
@@ -2205,6 +2630,7 @@ class MainWindow(QMainWindow):
             print("Points must be added before tracking")
             self._update_current_frame_display()
     
+    @monitored_operation("Tracking forward")
     def track_forward(self):
         """Track objects forward from the current frame to the out point (or end of video)"""
         self.settings_mgr.save_session_settings()
@@ -2224,6 +2650,7 @@ class MainWindow(QMainWindow):
             print("Points must be added before tracking")
             self._update_current_frame_display()
 
+    @monitored_operation("Tracking backward")
     def track_backward(self):
         """Track objects backward from the current frame to the in point (or start of video)"""
         self.settings_mgr.save_session_settings()
@@ -2243,6 +2670,7 @@ class MainWindow(QMainWindow):
             print("Points must be added before tracking")
             self._update_current_frame_display()
 
+    @monitored_operation("Tracking one frame forward")
     def track_one_frame_forward(self):
         """Track objects one frame forward from the current frame"""
         count = len(self.point_manager.points)
@@ -2261,6 +2689,7 @@ class MainWindow(QMainWindow):
             print("Points must be added before tracking")
             self._update_current_frame_display()
 
+    @monitored_operation("Tracking one frame backward")
     def track_one_frame_backward(self):
         """Track objects one frame backward from the current frame"""
         count = len(self.point_manager.points)
@@ -2309,6 +2738,7 @@ class MainWindow(QMainWindow):
         self.update_removal_status()
         self._update_current_frame_display()
 
+    @monitored_operation("Cleaning duplicate masks")
     def deduplicate_similar_masks(self):
         """Deduplicate similar masks"""
         #print("Running deduplication...")
@@ -2324,6 +2754,7 @@ class MainWindow(QMainWindow):
             self.update_deduplicate_status()
         self.settings_mgr.save_session_settings()
 
+    @monitored_operation("Running matting")
     def run_matting(self):
         """Run matting process"""
         self.settings_mgr.save_session_settings()
@@ -2383,6 +2814,49 @@ class MainWindow(QMainWindow):
         else:
             print("Points must be added on the Segmentation tab before matting")
 
+    def unload_segmentation_for_matting(self):
+        """Release SAM while preserving the on-disk masks MatAnyone consumes."""
+        if self.sam_manager.predictor is None:
+            show_message_dialog(
+                self,
+                title="Segmentation Model Already Unloaded",
+                message=(
+                    "There is no segmentation model in memory. Your saved points "
+                    "and mask files are still available for matting."
+                ),
+                type="info",
+            )
+            return
+
+        model_name = self.sam_manager.loaded_model_name or "segmentation model"
+        reply = QMessageBox.question(
+            self,
+            "Unload Segmentation Model?",
+            (
+                f"Unload {model_name} to free memory for matting?\n\n"
+                "Your original video, extracted frames, points, and saved masks "
+                "will not be deleted. The live tracking state will be released. "
+                "To add or preview more segmentation points afterward, return "
+                "to the Segmentation tab and press Load Model."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.sam_manager.unload_segmentation_model()
+        self.segmentation_tab.sam_model_btn.setEnabled(True)
+        self.matting_tab.unload_segmentation_btn.setEnabled(False)
+        self.matting_tab.unload_segmentation_btn.setText(
+            "SAM Unloaded"
+        )
+        print(
+            f"Unloaded {model_name}. Saved points and masks remain available "
+            "for matting."
+        )
+
+    @monitored_operation("Removing object")
     def run_object_removal(self):
         """Run object removal process"""
 
@@ -2724,7 +3198,7 @@ class MainWindow(QMainWindow):
         
         # Point operations
         self._create_shortcut("Ctrl+Z", self.undo_last_point, "Remove Last Point")
-        self._create_shortcut("Delete", self.delete_selected_point, "Delete Selected Point")
+        self._create_shortcut("Delete", self.delete_selected_point, "Delete Selected Points")
         self._create_shortcut("Ctrl+Delete", self.clear_frame_points, "Clear Frame Points")
         self._create_shortcut("Shift+Delete", self.clear_object_points, "Clear Object Points")
         self._create_shortcut("Ctrl+Shift+Delete", self.clear_all_points, "Clear All Points")
@@ -2810,6 +3284,7 @@ class MainWindow(QMainWindow):
         
         self.load_file(file_path)
         
+    @monitored_operation("Loading and extracting video")
     def load_file(self, file_path):
         """Load a file (consolidated method for both menu and command line usage)"""
         # Clear all points and propagation data
@@ -3053,8 +3528,26 @@ class MainWindow(QMainWindow):
         
         # Save all splitter sizes
         self.settings_mgr.set_app_setting("main_splitter_sizes", self.main_splitter.sizes())
-        self.settings_mgr.set_app_setting("vertical_splitter_sizes", self.vertical_splitter.sizes())
-        self.settings_mgr.set_app_setting("bottom_splitter_sizes", self.bottom_splitter.sizes())
+        # Expansion is a temporary viewing mode. Persist the layout that will
+        # be restored rather than the hidden/collapsed splitter geometry.
+        point_list_expanded = (
+            hasattr(self, "expand_point_list_btn")
+            and self.expand_point_list_btn.isChecked()
+        )
+        vertical_sizes = (
+            getattr(self, "_point_list_restore_vertical_sizes", None)
+            if point_list_expanded else self.vertical_splitter.sizes()
+        )
+        bottom_sizes = (
+            getattr(self, "_point_list_restore_bottom_sizes", None)
+            if point_list_expanded else self.bottom_splitter.sizes()
+        )
+        self.settings_mgr.set_app_setting(
+            "vertical_splitter_sizes", vertical_sizes or self.vertical_splitter.sizes()
+        )
+        self.settings_mgr.set_app_setting(
+            "bottom_splitter_sizes", bottom_sizes or self.bottom_splitter.sizes()
+        )
         
         # Save to disk
         self.settings_mgr.save_app_settings()

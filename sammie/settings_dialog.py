@@ -101,11 +101,11 @@ class SettingsDialog(QDialog):
         proc_layout = QFormLayout(proc_group)
 
         self.default_holes_spin = QSpinBox()
-        self.default_holes_spin.setRange(0, 50)
+        self.default_holes_spin.setRange(0, 200)
         proc_layout.addRow("Default Remove Holes:", self.default_holes_spin)
         
         self.default_dots_spin = QSpinBox()
-        self.default_dots_spin.setRange(0, 50)
+        self.default_dots_spin.setRange(0, 200)
         proc_layout.addRow("Default Remove Dots:", self.default_dots_spin)
         
         self.default_border_spin = QSpinBox()

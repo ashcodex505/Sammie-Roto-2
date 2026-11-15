@@ -1,11 +1,22 @@
 # sammie/core.py
 import cv2
 import os
+import sys
 import numpy as np
+
+# PyTorch reads its MPS allocator settings during initialization, so these must
+# be present before importing torch.  Respect explicit user overrides.
+if sys.platform == "darwin":
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.75")
+    os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.60")
+
 import torch
 import warnings
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from sammie.settings_manager import get_settings_manager
+from sammie.performance_trace import trace_performance_call
 
 # .........................................................................................
 # Global variables
@@ -19,11 +30,24 @@ matting_dir = os.path.join(temp_dir, "matting")
 removal_dir = os.path.join(temp_dir, "removal")
 
 PALETTE = [
-    (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128), (0, 128, 128),
-    (128, 128, 128), (64, 0, 0), (191, 0, 0), (64, 128, 0), (191, 128, 0), (64, 0, 128),
-    (191, 0, 128), (64, 128, 128), (191, 128, 128), (0, 64, 0), (128, 64, 0), (0, 191, 0),
-    (128, 191, 0), (0, 64, 128), (128, 64, 128)
+    # High-contrast colors keep nearby object IDs visually distinguishable.
+    # In particular, IDs 0 and 8 used to be two very similar shades of red.
+    (230, 25, 75), (60, 180, 75), (0, 130, 200), (245, 130, 48),
+    (145, 30, 180), (70, 240, 240), (240, 50, 230), (250, 190, 212),
+    (210, 245, 60), (0, 128, 128), (220, 190, 255), (170, 110, 40),
+    (255, 250, 200), (128, 0, 0), (170, 255, 195), (128, 128, 0),
+    (255, 215, 180), (0, 0, 128), (128, 128, 128), (255, 255, 255),
+    (90, 90, 90),
 ]
+
+
+def next_available_object_id(points, maximum=20):
+    """Return the lowest object ID not already used by a saved point."""
+    used = {int(point['object_id']) for point in points}
+    for object_id in range(maximum + 1):
+        if object_id not in used:
+            return object_id
+    return None
 
 class VideoInfo:
     width = 0
@@ -42,7 +66,6 @@ class DeviceManager:
         if cls._device is not None:
             return cls._device  # already set
 
-        os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         print("PyTorch version:", torch.__version__)
 
         is_rocm = "rocm" in torch.__version__.lower()
@@ -114,16 +137,12 @@ class DeviceManager:
                     # Older NVIDIA GPUs: stay with FP32
                     else:
                         cls._dtype = torch.float32
-                torch.autocast("cuda", dtype=cls._dtype).__enter__()
-
         elif cls._device.type == "mps":
             cls._dtype = torch.float16
-            torch.autocast("mps", dtype=cls._dtype).__enter__()
         
         elif cls._device.type == "xpu":
             # A user confirmed that bf16 and fp16 gave broken masks on Arc A750
             cls._dtype = torch.float32
-            torch.autocast("xpu", dtype=cls._dtype).__enter__()
 
         return cls._device
 
@@ -136,10 +155,32 @@ class DeviceManager:
 
     @classmethod
     def get_dtype(cls):
-        """Return the storage/compute dtype matching the active autocast setup"""
+        """Return the preferred inference dtype for the active device."""
         if cls._device is None:
             cls.setup_device()
         return cls._dtype
+
+    @classmethod
+    @contextmanager
+    def inference_context(cls):
+        """Scope inference-only mode and mixed precision to one model operation.
+
+        CPU and devices configured for float32 use inference mode without
+        autocast. CUDA/ROCm and MPS use the dtype selected by setup_device().
+        """
+        device = cls.get_device()
+        dtype = cls.get_dtype()
+        use_autocast = (
+            device.type in {"cuda", "mps", "xpu"}
+            and dtype in {torch.float16, torch.bfloat16}
+        )
+        autocast_context = (
+            torch.autocast(device_type=device.type, dtype=dtype)
+            if use_autocast
+            else nullcontext()
+        )
+        with torch.inference_mode(), autocast_context:
+            yield
 
     @classmethod
     def clear_cache(cls):
@@ -509,28 +550,52 @@ def apply_matany_postprocessing(mask):
 
 
 def fill_small_holes(mask, holes_value):
-    max_hole_area = holes_value ** 2
-    filled_mask = mask.copy()
-    contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    with trace_performance_call(
+            "postprocess.fill_holes", device="cpu", strength=holes_value,
+            pixels=int(mask.size)):
+        max_hole_area = holes_value ** 2
+        foreground = mask > 0
+        background = (~foreground).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            background, connectivity=8
+        )
 
-    for i, contour in enumerate(contours):
-        area = cv2.contourArea(contour)
-        if area <= max_hole_area and hierarchy[0][i][3] != -1:  # Check if it's a hole (child contour)
-            cv2.drawContours(filled_mask, [contour], -1, 255, thickness=cv2.FILLED)
+        filled_mask = mask.copy()
+        height, width = mask.shape
+        for label in range(1, num_labels):
+            x = stats[label, cv2.CC_STAT_LEFT]
+            y = stats[label, cv2.CC_STAT_TOP]
+            component_width = stats[label, cv2.CC_STAT_WIDTH]
+            component_height = stats[label, cv2.CC_STAT_HEIGHT]
+            area = stats[label, cv2.CC_STAT_AREA]
+            touches_edge = (
+                x == 0 or y == 0
+                or x + component_width == width
+                or y + component_height == height
+            )
+            if not touches_edge and area <= max_hole_area:
+                filled_mask[labels == label] = 255
 
-    return filled_mask
+        return filled_mask
 
 
 def remove_small_dots(mask, dots_value):
-    max_dot_area = dots_value ** 2
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    with trace_performance_call(
+            "postprocess.remove_dots", device="cpu", strength=dots_value,
+            pixels=int(mask.size)):
+        max_dot_area = dots_value ** 2
+        foreground = (mask > 0).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            foreground, connectivity=8
+        )
 
-    cleaned_mask = np.zeros_like(mask)
-    for label in range(1, num_labels):  # skip background
-        if stats[label, cv2.CC_STAT_AREA] > max_dot_area:
-            cleaned_mask[labels == label] = 255
+        cleaned_mask = np.zeros_like(mask)
+        for label in range(1, num_labels):  # skip background
+            if stats[label, cv2.CC_STAT_AREA] > max_dot_area:
+                component = labels == label
+                cleaned_mask[component] = mask[component]
 
-    return cleaned_mask
+        return cleaned_mask
 
 
 def grow_shrink(mask, grow_value):

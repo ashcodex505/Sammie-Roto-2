@@ -488,6 +488,8 @@ class ExportDialog(QDialog):
         
         # Disable export button
         self.export_btn.setEnabled(False)
+        if self.parent_window:
+            self.parent_window._begin_operation("Exporting video")
         
         # Start export
         self.export_worker.start()
@@ -727,6 +729,8 @@ class ExportDialog(QDialog):
     
     def _export_finished(self, success, message):
         """Handle export completion"""
+        if self.parent_window:
+            self.parent_window._end_operation()
         if self.progress_dialog:
             self.progress_dialog.close()
             self.progress_dialog = None

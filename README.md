@@ -39,6 +39,24 @@ Sammie-Roto 2 is free and open source, but runs models produced by several exter
 - Execute the following command in the terminal: `bash install.sh` then follow the prompt.
 - When it finishes, launch from the Sammie-Roto-2 icon on your Desktop, from Spotlight, or with `bash run_sammie.sh`.
 
+On Apple Silicon, **Base+ MLX FP16** uses Meta's official SAM 2.1 Base+
+checkpoint at its native 1024-pixel model resolution. The first load performs a
+one-time local conversion to MLX FP16. Converted weights are verified and kept
+under `checkpoints/`; the original official checkpoint remains the source of
+truth. The existing PyTorch **Base** and **Anime** models remain
+available.
+
+**SAM 3.1 MLX** replaces the retired SAM 2.1 Large option on Apple Silicon.
+It runs at SAM 3.1's native 1008-pixel tracker resolution, supports Sammie's
+existing positive/negative point workflow, later-frame corrections, multiple
+objects, and forward/reverse propagation. The adapter lazily reads frames,
+retains only one frame's model features, and uses SAM 3.1's bounded temporal
+memory so long clips do not preload the full video into unified memory.
+
+For a Git clone, initialize the pinned MLX runtime with
+`git submodule update --init --recursive`. The installer performs the equivalent
+exact-commit download automatically for release archives.
+
 #### Linux
 - Download latest version from [releases](https://github.com/Zarxrax/Sammie-Roto-2/releases)
 - Extract the zip archive.
@@ -66,7 +84,9 @@ If you want to remove the application, simply delete the Sammie-Roto folder. Sho
 
 ### Acknowledgements
 * [SAM 2](https://github.com/facebookresearch/sam2)
-* [EfficientTAM](https://github.com/yformer/EfficientTAM)
+* [SAM 3.1](https://huggingface.co/facebook/sam3.1) and
+  [MLX Community](https://huggingface.co/mlx-community/sam3.1-bf16)
+* [sam2-mlx](https://github.com/avbiswas/sam2-mlx) (Apple MLX runtime)
 * [MatAnyone](https://github.com/pq-yang/MatAnyone) & [MatAnyone2](https://github.com/pq-yang/MatAnyone2)
 * [Wan2GP](https://github.com/deepbeepmeep/Wan2GP) (for optimized MatAnyone code)
 * [VideoMaMa](https://github.com/cvlab-kaist/VideoMaMa)

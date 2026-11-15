@@ -8,7 +8,8 @@ import glob
 import zipfile
 import threading
 import queue
-import multiprocessing
+import gc
+from functools import wraps
 import av
 from tqdm import tqdm
 from PySide6.QtGui import QPixmap, QImage
@@ -21,11 +22,49 @@ from sammie.duplicate_frame_handler import replace_similar_matte_frames
 from sammie.settings_manager import get_settings_manager
 from sammie.gui_widgets import show_message_dialog
 from sammie.model_downloader import ensure_models
+from sammie.segmentation import (
+    MLX_MODEL_NAME,
+    SAM31_MODEL_NAME,
+    build_mlx_sam21_predictor,
+    build_mlx_sam31_predictor,
+    is_mlx_sam21_model,
+    is_mlx_sam31_model,
+    sam31_checkpoint_ready,
+)
+from sammie.segmentation.mlx_sam21 import clear_mlx_cache
+from sammie.segmentation.mlx_sam31 import clear_mlx_sam31_cache
 
 smoothing_model = None  # global variable needed to avoid complexity of passing the model around
 
+
+def _segmentation_inference_context(function):
+    """Use Torch inference mode only for Torch-backed segmentation models."""
+
+    @wraps(function)
+    def wrapped(manager, *args, **kwargs):
+        if (is_mlx_sam21_model(manager.loaded_model_name)
+                or is_mlx_sam31_model(manager.loaded_model_name)):
+            return function(manager, *args, **kwargs)
+        with core.DeviceManager.inference_context():
+            return function(manager, *args, **kwargs)
+
+    return wrapped
+
+
+def _binary_mask_numpy(mask_logits) -> np.ndarray:
+    """Convert either Torch tensors or NumPy/MLX results into an 8-bit mask."""
+
+    binary = mask_logits > 0.0
+    if hasattr(binary, "detach"):
+        binary = binary.detach()
+    if hasattr(binary, "cpu"):
+        binary = binary.cpu()
+    if hasattr(binary, "numpy"):
+        binary = binary.numpy()
+    return np.asarray(binary).squeeze().astype(np.uint8) * 255
+
 # .........................................................................................
-# SAM2 / EfficientTAM segmentation
+# SAM2 segmentation
 # .........................................................................................
 
 class SamManager(core.CallbackMixin):
@@ -44,20 +83,52 @@ class SamManager(core.CallbackMixin):
             sam_model = settings_mgr.get_session_setting("sam_model", "Base")
         else:
             sam_model = model
+        # Migrate sessions saved before retired model choices were removed.
+        if sam_model == "Efficient":
+            print("EfficientTAM is no longer available; using SAM2 Base instead")
+            sam_model = "Base"
+        elif sam_model == "Large":
+            print("SAM2 Large was replaced by SAM 3.1 MLX")
+            sam_model = SAM31_MODEL_NAME
         core.DeviceManager.clear_cache()
+        if is_mlx_sam31_model(sam_model):
+            if not sam31_checkpoint_ready():
+                show_message_dialog(
+                    parent_window,
+                    "SAM 3.1 checkpoint missing",
+                    "Download mlx-community/sam3.1-bf16 into "
+                    "checkpoints/sam3.1-mlx-bf16 before loading this model.",
+                    type="error",
+                )
+                return False
+            settings_mgr = get_settings_manager()
+            self.predictor = build_mlx_sam31_predictor(
+                cache_limit_mib=settings_mgr.get_app_setting("mlx_cache_limit_mib", 256),
+                memory_limit_mib=settings_mgr.get_app_setting("sam31_memory_limit_mib", 10240),
+                feature_cache_size=settings_mgr.get_app_setting("sam31_feature_cache_size", 3),
+            )
+            self.loaded_model_name = sam_model
+            print("Loaded SAM 3.1 MLX model (1008px)")
+            return True
+        if is_mlx_sam21_model(sam_model):
+            if not ensure_models("Base", parent=parent_window):
+                return False
+            settings_mgr = get_settings_manager()
+            self.predictor = build_mlx_sam21_predictor(
+                cache_limit_mib=settings_mgr.get_app_setting("mlx_cache_limit_mib", 256),
+                memory_limit_mib=settings_mgr.get_app_setting("mlx_memory_limit_mib", 6144),
+                frame_cache_size=settings_mgr.get_app_setting("mlx_frame_cache_size", 3),
+                state_window=settings_mgr.get_app_setting("mlx_state_window", 16),
+            )
+            self.loaded_model_name = sam_model
+            print("Loaded SAM 2.1 Base+ MLX FP16 model (1024px)")
+            return True
+
         device = core.DeviceManager.get_device()
-        if sam_model == "Large":
-            print("Loaded SAM2 Large model")
-            checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
-            model_cfg = "./configs/sam2.1/sam2.1_hiera_l.yaml"
-        elif sam_model == "Base":
+        if sam_model == "Base":
             print("Loaded SAM2 Base model")
             checkpoint = "./checkpoints/sam2.1_hiera_base_plus.pt"
             model_cfg = "./configs/sam2.1/sam2.1_hiera_b+.yaml"
-        elif sam_model == "Efficient":
-            print("Loaded EfficientTAM 512x512 model")
-            checkpoint = "./checkpoints/efficienttam_s_512x512.pt"
-            model_cfg = "./configs/sam2.1/efficienttam_s_512x512.yaml"
         elif sam_model == "Anime":
             print("Loaded SAM2 Anime model")
             checkpoint = "./checkpoints/sam2.1_anime_v1.pt"
@@ -73,13 +144,32 @@ class SamManager(core.CallbackMixin):
 
     def unload_segmentation_model(self):
         """Unload the SAM model and clear cache"""
+        was_mlx21 = is_mlx_sam21_model(self.loaded_model_name)
+        was_mlx31 = is_mlx_sam31_model(self.loaded_model_name)
+        was_mlx = was_mlx21 or was_mlx31
+        if was_mlx and self.predictor is not None:
+            release = getattr(self.predictor, "release", None)
+            if release is not None:
+                release(self.inference_state)
         self.predictor = None
         self.inference_state = None
+        self.loaded_model_name = None
+        gc.collect()
+        if was_mlx21:
+            clear_mlx_cache()
+        elif was_mlx31:
+            clear_mlx_sam31_cache()
         core.DeviceManager.clear_cache()
         print("Unloaded Segmentation model")
 
     def offload_model_to_cpu(self):
         """Offload SAM2 model to CPU to free VRAM"""
+        if is_mlx_sam21_model(self.loaded_model_name) or is_mlx_sam31_model(self.loaded_model_name):
+            if is_mlx_sam21_model(self.loaded_model_name):
+                clear_mlx_cache()
+            else:
+                clear_mlx_sam31_cache()
+            return
         device = core.DeviceManager.get_device()
         if device.type == 'cpu':
             return  # Already on CPU, nothing to do
@@ -90,6 +180,8 @@ class SamManager(core.CallbackMixin):
 
     def load_model_to_device(self):
         """Load SAM2 model back to the active device"""
+        if is_mlx_sam21_model(self.loaded_model_name) or is_mlx_sam31_model(self.loaded_model_name):
+            return
         device = core.DeviceManager.get_device()
         if device.type == 'cpu':
             return  # Already on CPU, nothing to do
@@ -106,6 +198,10 @@ class SamManager(core.CallbackMixin):
         """Reset frame_number to a blank slate if it is been tracked,
         so new points generate a segment without using any memory from other frames
         """
+        clear_hook = getattr(self.predictor, "clear_frame_if_tracked", None)
+        if clear_hook is not None and clear_hook(
+                self.inference_state, object_id, frame_number):
+            return
         obj_idx = self.inference_state["obj_id_to_idx"].get(object_id)
         if obj_idx is None:
             return
@@ -124,6 +220,10 @@ class SamManager(core.CallbackMixin):
         """Capture everything _clear_frame_if_tracked (and add_new_points_or_box) could
         touch for this frame/object, so a preview can be undone without a trace.
         """
+        snapshot_hook = getattr(self.predictor, "snapshot_frame_state", None)
+        if snapshot_hook is not None:
+            return {"_predictor_snapshot": snapshot_hook(
+                self.inference_state, object_id, frame_number)}
         obj_idx = self.inference_state["obj_id_to_idx"].get(object_id)
         if obj_idx is None:
             # Object doesn't exist yet - add_new_points_or_box() will auto-register it
@@ -158,6 +258,11 @@ class SamManager(core.CallbackMixin):
         """Undo _snapshot_frame_state - restores frames_tracked_per_obj plus every
         cond/non-cond entry exactly as it was, regardless of what happened in between."""
         if snapshot is None:
+            return
+
+        if "_predictor_snapshot" in snapshot:
+            self.predictor.restore_frame_state(
+                self.inference_state, snapshot["_predictor_snapshot"])
             return
 
         object_id = snapshot["object_id"]
@@ -215,6 +320,7 @@ class SamManager(core.CallbackMixin):
         else:
             mask_inputs.pop(frame_number, None)
 
+    @_segmentation_inference_context
     def segment_image(self, frame_number, object_id, input_points, input_labels):
         extension = core.get_frame_extension()
         frame_filename = os.path.join(core.frames_dir, f"{frame_number:05d}.{extension}")
@@ -235,14 +341,14 @@ class SamManager(core.CallbackMixin):
                 if out_obj_id != object_id:
                     continue
                 mask_filename = os.path.join(core.mask_dir, f"{frame_number:05d}", f"{out_obj_id}.png")
-                mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                mask = (mask * 255).astype(np.uint8)
+                mask = _binary_mask_numpy(out_mask_logits[i])
                 os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
                 cv2.imwrite(mask_filename, mask)
 
             # Notify that segmentation is complete
             self._notify('segmentation_complete', frame=frame_number, object_id=object_id, out_obj_ids=out_obj_ids)
 
+    @_segmentation_inference_context
     def preview_point(self, frame_number, object_id, all_points, preview_x, preview_y, is_positive):
         """Run a preview using the video predictor, then revert the state."""
         if self.predictor is None or self.inference_state is None:
@@ -274,8 +380,7 @@ class SamManager(core.CallbackMixin):
             preview_mask = None
             for i, oid in enumerate(out_obj_ids):
                 if oid == object_id:
-                    mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                    preview_mask = (mask * 255).astype(np.uint8)
+                    preview_mask = _binary_mask_numpy(out_mask_logits[i])
                     break
 
             return preview_mask
@@ -287,63 +392,69 @@ class SamManager(core.CallbackMixin):
         finally:
             self._restore_frame_state(frame_number, snapshot)
 
+    @_segmentation_inference_context
     def replay_points(self, points_list):
-        """Replay all points incrementally to rebuild masks."""
-        frame_count = core.VideoInfo.total_frames
+        """Rebuild prompt state with one model call per object and frame.
+
+        ``add_new_points_or_box(clear_old_points=True)`` accepts the complete
+        prompt set, which is also what ``segment_image`` submits after a click.
+        Replaying every cumulative prefix made an undo with N points perform
+        1+2+...+N prompt work and needlessly blocked the UI.
+        """
         self.predictor.reset_state(self.inference_state)
 
-        for frame_number in range(frame_count):
-            frame_points = [p for p in points_list if p['frame'] == frame_number]
-            if not frame_points:
+        grouped_points = {}
+        for point in points_list:
+            key = (point['frame'], point['object_id'])
+            grouped_points.setdefault(key, []).append(
+                (point['x'], point['y'], point['positive'])
+            )
+
+        for (frame_number, object_id), filtered_points in sorted(grouped_points.items()):
+            input_points = np.array(
+                [(x, y) for x, y, _ in filtered_points], dtype=np.float32
+            )
+            input_labels = np.array(
+                [1 if positive else 0 for _, _, positive in filtered_points],
+                dtype=np.int32,
+            )
+            try:
+                _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(
+                    inference_state=self.inference_state,
+                    frame_idx=frame_number,
+                    obj_id=object_id,
+                    points=input_points,
+                    labels=input_labels,
+                    clear_old_points=True,
+                )
+            except Exception as error:
+                print(
+                    f"Error replaying {len(filtered_points)} points for frame "
+                    f"{frame_number}, object {object_id}: {error}"
+                )
                 continue
 
-            frame_object_ids = {p['object_id'] for p in frame_points}
-            for object_id in frame_object_ids:
-                filtered_points = [
-                    (p['x'], p['y'], p['positive'])
-                    for p in frame_points if p['object_id'] == object_id
-                ]
-                out_obj_ids, out_mask_logits = [], []  # guards the save loop below if every add fails
-                for i in range(1, len(filtered_points) + 1):
-                    # Replay one click at a time, in the order they were made - matches
-                    # how segment_image() was actually called during live editing
-                    # (each click resubmits the full point set so far as its own
-                    # separate call). This matters for fidelity: e.g. undoing the
-                    # last point needs to reproduce the mask state that existed right
-                    # before that point was added, not the mask a single batched call
-                    # with the remaining points would produce - those aren't the same.
-                    subset = filtered_points[:i]
-                    input_points = np.array([(x, y) for x, y, _ in subset], dtype=np.float32)
-                    input_labels = np.array([1 if pos else 0 for _, _, pos in subset], dtype=np.int32)
-                    try:
-                        _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(
-                            inference_state=self.inference_state,
-                            frame_idx=frame_number,
-                            obj_id=object_id,
-                            points=input_points,
-                            labels=input_labels,
-                            clear_old_points=True
-                        )
-                    except Exception as e:
-                        print(f"Error during prediction for frame {frame_number}, object {object_id}, point {i}: {e}")
-                        continue
-
-                # Save the mask for the object we just replayed only
-                for j, out_obj_id in enumerate(out_obj_ids):
-                    if out_obj_id != object_id:
-                        continue
-                    mask_filename = os.path.join(core.mask_dir, f"{frame_number:05d}", f"{out_obj_id}.png")
-                    mask = (out_mask_logits[j] > 0.0).cpu().numpy().squeeze()
-                    mask = (mask * 255).astype(np.uint8)
-                    try:
-                        os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
-                        cv2.imwrite(mask_filename, mask)
-                    except Exception as e:
-                        print(f"Error saving mask for frame {frame_number}, object {out_obj_id}: {e}")
+            # Save only the mask for the object whose prompts were replayed.
+            for j, out_obj_id in enumerate(out_obj_ids):
+                if out_obj_id != object_id:
+                    continue
+                mask_filename = os.path.join(
+                    core.mask_dir, f"{frame_number:05d}", f"{out_obj_id}.png"
+                )
+                mask = _binary_mask_numpy(out_mask_logits[j])
+                try:
+                    os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
+                    cv2.imwrite(mask_filename, mask)
+                except Exception as error:
+                    print(
+                        f"Error saving mask for frame {frame_number}, "
+                        f"object {out_obj_id}: {error}"
+                    )
 
         self._notify('replay_complete')
 
 
+    @_segmentation_inference_context
     def _propagate(self, parent_window, start_frame_idx, max_frame_num_to_track, reverse=False,
                     show_progress=True):
         """Core propagation loop shared by all tracking functions.
@@ -381,8 +492,7 @@ class SamManager(core.CallbackMixin):
                 max_frame_num_to_track=max_frame_num_to_track, reverse=reverse):
             for i, out_obj_id in enumerate(out_obj_ids):
                 mask_filename = os.path.join(core.mask_dir, f"{out_frame_idx:05d}", f"{out_obj_id}.png")
-                mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                mask = (mask * 255).astype(np.uint8)
+                mask = _binary_mask_numpy(out_mask_logits[i])
                 os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
                 cv2.imwrite(mask_filename, mask)
 
@@ -982,8 +1092,23 @@ def load_video(video_file, parent_window):
     frame_format = settings_mgr.get_app_setting("frame_format", "png")
 
     # --- Threaded frame writing setup ---
-    save_q = queue.Queue(maxsize=100)
-    num_workers = max(2, multiprocessing.cpu_count() // 2)
+    # A decoded 4K RGB frame is about 24 MiB.  The previous 100-frame queue could
+    # therefore retain gigabytes of unified memory. PyAV decodes on its own
+    # internally threaded producer while four consumers encode/write PNG frames
+    # concurrently. Back-pressure is intentional: decoding pauses whenever the
+    # small queue is full, keeping memory bounded on 16 GiB Macs.
+    queue_size = max(1, int(settings_mgr.get_app_setting("frame_writer_queue_size", 4)))
+    requested_workers = int(settings_mgr.get_app_setting("frame_writer_threads", 4))
+    num_workers = max(1, min(requested_workers, os.cpu_count() or 1))
+    png_compression = max(
+        0, min(9, int(settings_mgr.get_app_setting("frame_png_compression", 1)))
+    )
+    save_q = queue.Queue(maxsize=queue_size)
+
+    if frame_format.lower() == "png":
+        write_params = [cv2.IMWRITE_PNG_COMPRESSION, png_compression]
+    else:
+        write_params = []
 
     def save_worker():
         while True:
@@ -993,7 +1118,7 @@ def load_video(video_file, parent_window):
                 break
             path, frame = item
             try:
-                cv2.imwrite(path, frame)
+                cv2.imwrite(path, frame, write_params)
             except Exception as e:
                 print(f"Error writing {path}: {e}")
             save_q.task_done()

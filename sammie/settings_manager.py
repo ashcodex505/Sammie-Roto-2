@@ -1,10 +1,18 @@
 # sammie/settings_manager.py
 import json
 import os
+import platform
 import shutil
 from typing import Dict, Any, Optional
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
+
+
+def _default_segmentation_model() -> str:
+    """Prefer native MLX quality mode on Apple Silicon."""
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        return "Base+ MLX FP16"
+    return "Base"
 
 @dataclass
 class ApplicationSettings:
@@ -31,7 +39,7 @@ class ApplicationSettings:
     default_object_id: int = 0
     
     # Segmentation Processing defaults
-    default_sam_model: str = "Base"
+    default_sam_model: str = field(default_factory=_default_segmentation_model)
     default_holes: int = 0
     default_dots: int = 0
     default_border_fix: int = 0
@@ -61,7 +69,25 @@ class ApplicationSettings:
     # Performance
     force_cpu: bool = False    
     frame_format: str = "png"
-    display_update_frequency: int = 5
+    # The progress dialog updates every frame. Re-render the full 4K composite
+    # less often so mask postprocessing does not stall tracking.
+    display_update_frequency: int = 30
+    # Keep video import memory and CPU pressure predictable on unified-memory Macs.
+    frame_writer_queue_size: int = 4
+    frame_writer_threads: int = 4
+    frame_png_compression: int = 1
+
+    # SAM 2.1 MLX: quality remains fixed at 1024/FP16; these settings bound
+    # reusable allocations and clip-length-dependent tracking state.
+    mlx_cache_limit_mib: int = 256
+    mlx_memory_limit_mib: int = 6144
+    mlx_frame_cache_size: int = 3
+    mlx_state_window: int = 16
+    # Cache a few full-quality feature frames so corrections on nearby frames
+    # avoid repeating the ~2.4-second visual backbone pass. Each extra entry is
+    # roughly 40-80 MiB on the current SAM 3.1 model.
+    sam31_memory_limit_mib: int = 10240
+    sam31_feature_cache_size: int = 3
     
     # Deduplication
     dedupe_threshold: float = 0.8
@@ -106,7 +132,7 @@ class SessionSettings:
     show_all_points: bool = True  # If True, show points from all frames
     
     # Segmentation parameters
-    sam_model: str = "Base"
+    sam_model: str = field(default_factory=_default_segmentation_model)
     holes: int = 0
     dots: int = 0
     border_fix: int = 0

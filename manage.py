@@ -1,4 +1,4 @@
-import os, sys, subprocess, platform, tomllib, shutil, shlex
+import os, sys, subprocess, platform, tomllib, shutil, shlex, tarfile, tempfile, plistlib
 import urllib.request
 
 # ===== CONFIG =====
@@ -6,6 +6,68 @@ PYTHON_VERSION = "3.12"
 REPO_URL = "https://github.com/Zarxrax/Sammie-Roto-2.git"
 REPO_RAW_BASE = "https://raw.githubusercontent.com/Zarxrax/Sammie-Roto-2"
 DEFAULT_BRANCH = "main"
+MLX_SAM_COMMIT = "fbeafa7531be454b8f42d89c13d1e90024a63f6b"
+MLX_SAM_ARCHIVE = f"https://github.com/avbiswas/sam2-mlx/archive/{MLX_SAM_COMMIT}.tar.gz"
+
+
+def ensure_mlx_sam_runtime():
+    """Materialize the pinned optional MLX runtime on Apple Silicon.
+
+    Git submodules cover normal clones. The exact-commit archive fallback also
+    supports GitHub source archives and Sammie's installer/update workflow.
+    """
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        return
+    app_dir = os.path.abspath(os.path.dirname(__file__))
+    destination = os.path.join(app_dir, "third_party", "sam2-mlx")
+    marker = os.path.join(destination, "src", "mlx_sam", "video_predictor.py")
+    if os.path.isfile(marker):
+        return
+
+    # In a real clone, let Git materialize the gitlink recorded by this
+    # repository. This keeps `git pull --rebase` and later submodule updates
+    # clean. GitHub source archives do not include `.git`, so they use the
+    # exact-commit archive fallback below.
+    if os.path.isdir(os.path.join(app_dir, ".git")):
+        try:
+            subprocess.run(
+                [
+                    "git", "-C", app_dir, "submodule", "update", "--init",
+                    "--recursive", "--", "third_party/sam2-mlx",
+                ],
+                check=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            print(f"[Submodule initialization failed; using archive fallback: {error}]")
+        if os.path.isfile(marker):
+            return
+
+    print("[Installing pinned SAM 2 MLX runtime...]")
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="sammie-mlx-") as temp_dir:
+        archive = os.path.join(temp_dir, "runtime.tar.gz")
+        urllib.request.urlretrieve(MLX_SAM_ARCHIVE, archive)
+        unpacked = os.path.join(temp_dir, "unpacked")
+        os.makedirs(unpacked)
+        with tarfile.open(archive, "r:gz") as bundle:
+            root = os.path.realpath(unpacked)
+            for member in bundle.getmembers():
+                target = os.path.realpath(os.path.join(unpacked, member.name))
+                if os.path.commonpath((root, target)) != root:
+                    raise RuntimeError("Unsafe path in SAM 2 MLX runtime archive")
+            bundle.extractall(unpacked, filter="data")
+        candidates = [
+            path for path in os.listdir(unpacked)
+            if os.path.isdir(os.path.join(unpacked, path))
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError("Unexpected SAM 2 MLX archive layout")
+        source = os.path.join(unpacked, candidates[0])
+        if os.path.isdir(destination):
+            shutil.rmtree(destination)
+        shutil.copytree(source, destination)
+    if not os.path.isfile(marker):
+        raise RuntimeError("SAM 2 MLX runtime installation did not complete")
 
 def get_uv_exe():
     """Absolute path to the uv executable this installer bootstrapped with."""
@@ -173,7 +235,7 @@ def choose_backend():
     for i, (_, label) in enumerate(BACKEND_OPTIONS, 1):
         print(f"{i}) {label}")
 
-    choice = input("> ").strip()
+    choice = input( "> ").strip()
     try:
         return BACKEND_OPTIONS[int(choice) - 1][0]
     except (ValueError, IndexError):
@@ -218,6 +280,7 @@ def perform_update(branch):
     """Pulls the given branch, resyncs the environment, and refreshes
     shortcuts. Shared by both update paths in handle_update()."""
     pull_latest_code(branch)
+    ensure_mlx_sam_runtime()
     sync_env(resolve_backend())
     create_shortcuts()
     cleanup_cache()
@@ -323,6 +386,8 @@ def setup(branch, reinstall=False):
     # dependency install below fails partway.
     fix_permissions()
 
+    ensure_mlx_sam_runtime()
+
     run_command([get_uv_exe(), "python", "install", "--no-bin", PYTHON_VERSION])
 
     sync_env(backend, reinstall=reinstall)
@@ -341,14 +406,39 @@ def setup(branch, reinstall=False):
 
 # ===== CREATE SHORTCUTS =====
 def create_mac_app():
-    """Creates a double-clickable .app bundle on macOS."""
+    """Create a Spotlight-visible launcher in the user's Applications folder."""
 
     app_dir = os.path.abspath(os.path.dirname(__file__))
-    app_bundle = os.path.join(app_dir, "Sammie-Roto-2.app")
-    macos_dir = os.path.join(app_bundle, "Contents", "MacOS")
+    user_apps = os.path.join(os.path.expanduser("~"), "Applications")
+    os.makedirs(user_apps, exist_ok=True)
+    app_bundle = os.path.join(user_apps, "Sammie-Roto-2.app")
+
+    # Older installers put the bundle beside the source tree and symlinked it
+    # into ~/Applications. Spotlight does not consistently index application
+    # symlinks, so replace that link with a real bundle in the canonical app
+    # location. The small bundle still launches the selected Sammie checkout.
+    if os.path.islink(app_bundle):
+        os.unlink(app_bundle)
+    elif os.path.isdir(app_bundle):
+        shutil.rmtree(app_bundle)
+
+    log_path = os.path.join(os.path.expanduser("~"), "Library", "Logs", "Sammie-Roto-2.log")
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    shell_command = (
+        f"cd {shlex.quote(app_dir)} && "
+        "exec /bin/bash ./run_sammie.sh "
+        f">> {shlex.quote(log_path)} 2>&1 </dev/null &"
+    )
+    applescript_command = shell_command.replace("\\", "\\\\").replace('"', '\\"')
+    subprocess.run(
+        [
+            "osacompile", "-o", app_bundle, "-e",
+            f'do shell script "{applescript_command}"',
+        ],
+        check=True,
+    )
+
     resources_dir = os.path.join(app_bundle, "Contents", "Resources")
-    os.makedirs(macos_dir, exist_ok=True)
-    os.makedirs(resources_dir, exist_ok=True)
     version = get_local_version()  # pulls from pyproject.toml
 
     src_icon = os.path.join(app_dir, "sammie", "resources", "icon.icns")
@@ -356,57 +446,50 @@ def create_mac_app():
     if os.path.exists(src_icon):
         shutil.copy(src_icon, dest_icon)
 
-    # Launcher script
-    launcher_path = os.path.join(macos_dir, "launcher")
-    with open(launcher_path, "w") as f:
-        f.write(
-            '#!/usr/bin/env bash\n'
-            f'cd {shlex.quote(app_dir)}\n'
-            'exec /bin/bash ./run_sammie.sh\n'
-        )
-    os.chmod(launcher_path, os.stat(launcher_path).st_mode | 0o755)
-
-    # Info.plist
+    # Preserve the runtime keys generated by osacompile and add Sammie's app
+    # identity. The applet executable is a native universal Mach-O binary, so
+    # Launch Services handles it more reliably than a shell script executable.
     plist_path = os.path.join(app_bundle, "Contents", "Info.plist")
-    with open(plist_path, "w") as f:
-        f.write(
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
-            ' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-            '<plist version="1.0">\n'
-            '<dict>\n'
-            '    <key>CFBundleName</key>\n'
-            '    <string>Sammie-Roto-2</string>\n'
-            '    <key>CFBundleIconFile</key>\n'
-            '    <string>icon.icns</string>\n'
-            '    <key>CFBundleExecutable</key>\n'
-            '    <string>launcher</string>\n'
-            '    <key>CFBundleIdentifier</key>\n'
-            '    <string>com.zarxrax.sammie-roto-2</string>\n'
-            '    <key>CFBundleVersion</key>\n'
-            f'    <string>{version}</string>\n'
-            '    <key>CFBundleShortVersionString</key>\n'
-            f'    <string>{version}</string>\n'
-            '    <key>CFBundlePackageType</key>\n'
-            '    <string>APPL</string>\n'
-            '</dict>\n'
-            '</plist>\n'
-        )
+    with open(plist_path, "rb") as f:
+        app_info = plistlib.load(f)
+    app_info.update({
+        "CFBundleName": "Sammie-Roto-2",
+        "CFBundleDisplayName": "Sammie Roto 2",
+        "CFBundleIconFile": "icon.icns",
+        "CFBundleIdentifier": "com.zarxrax.sammie-roto-2",
+        "CFBundleVersion": version,
+        "CFBundleShortVersionString": version,
+        "LSApplicationCategoryType": "public.app-category.video",
+        "NSHighResolutionCapable": True,
+    })
+    with open(plist_path, "wb") as f:
+        plistlib.dump(app_info, f)
 
-    # Clear quarantine flag so Gatekeeper doesn't block it
+    # Clear quarantine/provenance metadata inherited from downloaded source
+    # files. Finder and Spotlight may silently refuse an unsigned script-based
+    # bundle when those attributes remain attached.
     try:
         subprocess.run(
-            ["xattr", "-dr", "com.apple.quarantine", app_bundle],
+            ["xattr", "-cr", app_bundle],
             check=True, stderr=subprocess.DEVNULL
         )
     except subprocess.CalledProcessError:
-        pass  # Not quarantined, nothing to clear
+        pass
+
+    # An ad-hoc signature is sufficient for a locally generated launcher. It
+    # gives Launch Services a complete, internally consistent app bundle while
+    # avoiding any requirement for an Apple Developer certificate.
+    try:
+        subprocess.run(
+            ["codesign", "--force", "--deep", "--sign", "-", app_bundle],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"[Warning: Could not sign macOS app bundle: {error}]")
 
     print(f"Created {app_bundle}")
 
-    # Create a symlink on the Desktop so the user has a convenient launch
-    # point, mirroring the Windows/Linux shortcuts, without moving the
-    # actual .app bundle (which must stay next to run_sammie.sh).
+    # Create a Desktop link to the canonical bundle for convenience.
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
     if os.path.isdir(desktop):
         desktop_link = os.path.join(desktop, "Sammie-Roto-2.app")
@@ -418,20 +501,8 @@ def create_mac_app():
         except OSError as e:
             print(f"[Warning: Could not create Desktop shortcut: {e}]")
 
-    # Also symlink into ~/Applications so Spotlight/Launchpad can find and
-    # launch it like a normal installed app.
-    user_apps = os.path.join(os.path.expanduser("~"), "Applications")
-    try:
-        os.makedirs(user_apps, exist_ok=True)
-        apps_link = os.path.join(user_apps, "Sammie-Roto-2.app")
-        if os.path.islink(apps_link) or os.path.exists(apps_link):
-            os.remove(apps_link)
-        os.symlink(app_bundle, apps_link)
-        print(f"Added to your Applications folder: {apps_link}")
-    except OSError as e:
-        print(f"[Warning: Could not add to ~/Applications: {e}]")
-
-    print("Double-click the Desktop icon to launch, or find it via Spotlight!")
+    print(f"Added to your Applications folder: {app_bundle}")
+    print("Double-click the Desktop icon or search Spotlight for 'Sammie Roto 2'.")
 
 
 def create_linux_desktop_entry():

@@ -44,17 +44,23 @@ class ConsoleRedirect(QObject):
 
     def __init__(self):
         super().__init__()
+        self._log_lock = threading.Lock()
+        self._closed = False
         # Create log file
         self.log_file = open("sammie_debug.log", "w", encoding="utf-8")
         self.log_file.write(f"\n=== Started: {datetime.now()} ===\n")
         self.log_file.flush()
         
     def write(self, text):
-        if not text:
+        if not text or self._closed:
             return
-        # Write to log file
-        self.log_file.write(text)
-        self.log_file.flush()
+        # Keep the complete on-disk log, but avoid forcing a synchronous disk
+        # flush for every tqdm-style carriage-return update. Newline-terminated
+        # messages are flushed promptly; flush() and close() cover the rest.
+        with self._log_lock:
+            self.log_file.write(text)
+            if text.endswith("\n"):
+                self.log_file.flush()
         
         # Detect carriage return without newline (tqdm-like progress)
         if "\r" in text and not text.endswith("\n"):
@@ -64,11 +70,19 @@ class ConsoleRedirect(QObject):
             self.text_written.emit(text, False)
 
     def flush(self):
-        pass
+        if self._closed:
+            return
+        with self._log_lock:
+            self.log_file.flush()
         
     def close(self):
-        self.log_file.write(f"=== Ended: {datetime.now()} ===\n")
-        self.log_file.close()
+        if self._closed:
+            return
+        with self._log_lock:
+            self.log_file.write(f"=== Ended: {datetime.now()} ===\n")
+            self.log_file.flush()
+            self.log_file.close()
+            self._closed = True
 
 
 # ==================== COLOR DISPLAY ====================
@@ -242,6 +256,7 @@ class PointTable(QTableWidget):
     """Custom table widget for displaying point data with delete functionality"""
     
     point_selected = Signal(list)  # Emits list of selected points data: {frame, object_id, x, y}
+    selection_count_changed = Signal(int)
 
     def __init__(self):
         super().__init__()
@@ -258,6 +273,9 @@ class PointTable(QTableWidget):
         # Configure table behavior
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        # Make multi-row selection explicit. Qt maps the platform-standard
+        # modifier (Command on macOS, Ctrl elsewhere) and Shift to this mode.
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setSortingEnabled(False)
         self.setAlternatingRowColors(True)
         
@@ -273,6 +291,9 @@ class PointTable(QTableWidget):
     def _create_colored_object_id_widget(self, object_id):
         """Create a widget with colored square and object ID number"""
         widget = QWidget()
+        # This is display-only content. Let clicks pass through to the table so
+        # the Object ID column selects rows just like every other data column.
+        widget.setAttribute(Qt.WA_TransparentForMouseEvents)
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(5, 2, 5, 2)
         layout.setSpacing(5)
@@ -381,13 +402,18 @@ class PointTable(QTableWidget):
         
         self.setCellWidget(row, 5, widget_container)
     
-    def delete_selected_row(self, single_row):
+    def delete_selected_row(self, single_row=None):
         """Delete the currently selected rows or a single specified row"""
         selected_rows = self.selectionModel().selectedRows()
-        
-        # If there are selected rows AND the clicked row is in the selection, delete all selected
-        if selected_rows and single_row in [idx.row() for idx in selected_rows]:
-            rows = sorted([idx.row() for idx in selected_rows], reverse=True)
+        selected_row_numbers = [index.row() for index in selected_rows]
+
+        # A bulk action or keyboard Delete removes the entire selection. A row's
+        # inline Delete button also removes the selection when that row belongs
+        # to it; otherwise it remains a one-row convenience action.
+        if single_row is None:
+            rows = sorted(selected_row_numbers, reverse=True)
+        elif selected_rows and single_row in selected_row_numbers:
+            rows = sorted(selected_row_numbers, reverse=True)
         # Otherwise, delete only the single clicked row
         else:
             rows = [single_row] if single_row is not None and single_row < self.rowCount() else []
@@ -455,6 +481,7 @@ class PointTable(QTableWidget):
         # The selection was cleared while signals were blocked, so tell listeners
         # explicitly (otherwise e.g. a selected-point highlight would go stale)
         self.point_selected.emit([])
+        self.selection_count_changed.emit(0)
         
         
         # Delete masks only for affected frames, then replay points to regenerate them
@@ -487,6 +514,7 @@ class PointTable(QTableWidget):
     def clear_points(self):
         """Remove all points from the table"""
         self.setRowCount(0)
+        self.selection_count_changed.emit(0)
     
     def remove_last_point(self):
         """Remove the most recently added point"""
@@ -497,6 +525,7 @@ class PointTable(QTableWidget):
     def _on_selection_changed(self):
         """Handle row selection changes"""
         selected_rows = self.selectionModel().selectedRows()
+        self.selection_count_changed.emit(len(selected_rows))
         point_data = []
         if selected_rows:
             for row in selected_rows:

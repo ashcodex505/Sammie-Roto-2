@@ -1,7 +1,7 @@
 import torch
-from torch.cuda.amp import autocast
 import numpy as np
 from sammie.srvgg_arch import SRVGGNetCompact
+from sammie import core
 
 # Load and prepare the model
 def prepare_smoothing_model(weights_path, device):
@@ -32,12 +32,7 @@ def postprocess(output_tensor):
 # Process a single image
 def run_smoothing_model(input_mask, model, device):
     input_tensor = preprocess_image(input_mask, device)
-    with torch.no_grad():
-        if device.type == "cuda":
-            # Enable automatic mixed precision
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
-                output_tensor = model(input_tensor)
-        else:
-            output_tensor = model(input_tensor)
+    with core.DeviceManager.inference_context():
+        output_tensor = model(input_tensor)
     return postprocess(output_tensor)
 

@@ -459,19 +459,9 @@ def ensure_models(
 # ---------------------------------------------------------------------------
 
 MODEL_REGISTRY: "dict[str, DownloadSpec]" = {
-    "Large": DownloadSpec(
-        url="https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt",
-        md5="2b30654b6112c42a115563c638d238d9",
-        dest_dir="checkpoints",
-    ),
     "Base": DownloadSpec(
         url="https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt",
         md5="ec7bd7d23d280d5e3cfa45984c02eda5",
-        dest_dir="checkpoints",
-    ),
-    "Efficient": DownloadSpec(
-        url="https://huggingface.co/yunyangx/efficient-track-anything/resolve/main/efficienttam_s_512x512.pt",
-        md5="962e151a9dca3b75d8228a16e5264010",
         dest_dir="checkpoints",
     ),
     "Anime": DownloadSpec(
@@ -573,4 +563,3 @@ if __name__ == "__main__":
             )
  
         spec.part_path.rename(spec.final_path)
- 

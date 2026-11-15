@@ -208,7 +208,7 @@ class MatAnyManager(MattingManager):
         self.processor = InferenceCore(matanyone, cfg=matanyone.cfg, device=device)
         return self.processor
 
-    @torch.inference_mode()
+    @core.DeviceManager.inference_context()
     def run_matting(self, points_list, parent_window, combined=False):
         """
         Run matting on all frames, using multiple keyframes for each object.
@@ -686,7 +686,7 @@ class VideoMaMaManager(MattingManager):
             self.pipeline = None
             return False
 
-    @torch.inference_mode()
+    @core.DeviceManager.inference_context()
     def run_matting(self, points_list, parent_window, combined=False):
         """
         Run matting on all frames, using tracked segmentation data.
