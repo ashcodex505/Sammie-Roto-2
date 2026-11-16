@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import unittest
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -41,12 +42,18 @@ class _PointManager:
 
 
 class _ReplayManager:
-    def __init__(self):
+    def __init__(self, replay_delay=0.0):
         self.propagated = True
         self.replayed_points = None
+        self.replay_delay = replay_delay
+        self.replace_calls = []
 
     def replay_points(self, points):
+        time.sleep(self.replay_delay)
         self.replayed_points = points
+
+    def replace_frame_object_points(self, frame, object_id, points):
+        self.replace_calls.append((frame, object_id, list(points)))
 
 
 class _ParentWindow:
@@ -72,7 +79,7 @@ class PointTableSelectionTests(unittest.TestCase):
         )
         self.assertEqual(table.selectionBehavior(), QAbstractItemView.SelectRows)
 
-    def test_bulk_delete_removes_every_selected_row_and_replays_once(self):
+    def test_bulk_delete_refreshes_each_affected_prompt_group_once(self):
         points = [
             {"frame": 10, "object_id": 1, "positive": True, "x": 100, "y": 200},
             {"frame": 11, "object_id": 1, "positive": True, "x": 110, "y": 210},
@@ -97,11 +104,41 @@ class PointTableSelectionTests(unittest.TestCase):
 
         self.assertEqual(table.rowCount(), 1)
         self.assertEqual(parent.point_manager.get_all_points(), [points[1]])
-        self.assertEqual(parent.sam_manager.replayed_points, [points[1]])
+        self.assertIsNone(parent.sam_manager.replayed_points)
+        self.assertEqual(
+            parent.sam_manager.replace_calls,
+            [(10, 1, []), (12, 2, [])],
+        )
         self.assertFalse(parent.sam_manager.propagated)
         self.assertFalse(parent.matany_manager.propagated)
         self.assertEqual(parent.tracking_status_updates, 1)
         self.assertEqual(selection_counts[-1], 0)
+
+    def test_single_delete_does_not_wait_for_full_project_replay(self):
+        points = [
+            {"frame": 10, "object_id": 1, "positive": True, "x": 100, "y": 200},
+            {"frame": 10, "object_id": 1, "positive": False, "x": 110, "y": 210},
+        ]
+        table = PointTable()
+        parent = _ParentWindow(points)
+        parent.sam_manager = _ReplayManager(replay_delay=0.2)
+        table.parent_window = parent
+        for point in points:
+            table.add_point(**point)
+
+        with TemporaryDirectory() as mask_directory, patch.object(
+            core, "mask_dir", mask_directory
+        ):
+            started = time.perf_counter()
+            table.delete_selected_row(0)
+            elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 0.1)
+        self.assertIsNone(parent.sam_manager.replayed_points)
+        self.assertEqual(
+            parent.sam_manager.replace_calls,
+            [(10, 1, [points[1]])],
+        )
 
     def test_expand_and_restore_point_list_panels(self):
         window = type("WindowParts", (), {})()

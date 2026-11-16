@@ -13,7 +13,6 @@ This module contains reusable UI components including:
 """
 
 import os
-import shutil
 import threading
 import requests
 from packaging import version
@@ -428,7 +427,7 @@ class PointTable(QTableWidget):
 
             # Batch remove all points first
             removed_points = []
-            affected_frames = set()  # Track which frames need mask regeneration
+            affected_pairs = set()  # Track each frame/object that needs regeneration
             for row in rows:
                 if row >= self.rowCount():
                     continue
@@ -439,8 +438,6 @@ class PointTable(QTableWidget):
                     continue
             
                 frame = int(frame_item.text())
-                affected_frames.add(frame) # This frame will be regenerated
-            
                 # Get object ID from the colored widget
                 object_id = 0
                 widget = self.cellWidget(row, 1)
@@ -452,6 +449,8 @@ class PointTable(QTableWidget):
                             break
                         except ValueError:
                             continue
+
+                affected_pairs.add((frame, object_id))
             
                 # Get coordinates
                 x_item = self.item(row, 3)
@@ -484,20 +483,27 @@ class PointTable(QTableWidget):
         self.selection_count_changed.emit(0)
         
         
-        # Delete masks only for affected frames, then replay points to regenerate them
+        # Rebuild only the prompt groups that changed. Replaying every point in
+        # the project made a one-point deletion scale with the entire project.
         if removed_points and hasattr(self, 'parent_window'):
-            # Delete mask directories for affected frames only
-            for frame in affected_frames:
-                frame_mask_dir = os.path.join(core.mask_dir, f"{frame:05d}")
-                if os.path.exists(frame_mask_dir):
-                    shutil.rmtree(frame_mask_dir)
-
-            # Replay points to regenerate masks for affected frames 
             points = self.parent_window.point_manager.get_all_points()
             self.parent_window.sam_manager.propagated = False
             self.parent_window.matany_manager.propagated = False
             self.parent_window.update_tracking_status()
-            self.parent_window.sam_manager.replay_points(points)
+            for frame, object_id in sorted(affected_pairs):
+                mask_path = os.path.join(
+                    core.mask_dir, f"{frame:05d}", f"{object_id}.png"
+                )
+                if os.path.exists(mask_path):
+                    os.remove(mask_path)
+                remaining = [
+                    point for point in points
+                    if point['frame'] == frame
+                    and point['object_id'] == object_id
+                ]
+                self.parent_window.sam_manager.replace_frame_object_points(
+                    frame, object_id, remaining
+                )
 
     def _update_delete_buttons(self):
         """Update all delete button connections after a row is removed"""

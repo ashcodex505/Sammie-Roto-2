@@ -269,6 +269,42 @@ class SegmentationTab(QWidget):
         self.track_objects_btn.setLayoutDirection(Qt.RightToLeft)  # Put icon on the right side of text
         tracking_layout.addWidget(self.track_objects_btn)
 
+        settings_mgr = get_settings_manager()
+        self.selected_object_only_checkbox = QCheckBox(
+            "Track selected object only"
+        )
+        self.selected_object_only_checkbox.setChecked(
+            settings_mgr.get_session_setting(
+                "track_selected_object_only", True
+            )
+        )
+        self.selected_object_only_checkbox.setToolTip(
+            "Track only the active object ID and leave every other saved mask unchanged."
+        )
+        self.selected_object_only_checkbox.toggled.connect(
+            lambda checked: settings_mgr.set_session_setting(
+                "track_selected_object_only", checked
+            )
+        )
+        tracking_layout.addWidget(self.selected_object_only_checkbox)
+
+        self.prevent_mask_drift_checkbox = QCheckBox(
+            "Limit sudden mask leaks"
+        )
+        self.prevent_mask_drift_checkbox.setChecked(
+            settings_mgr.get_session_setting("prevent_mask_drift", True)
+        )
+        self.prevent_mask_drift_checkbox.setToolTip(
+            "Trim sudden growth far outside the previous frame without locking "
+            "old mask shapes in place. Correction-point frames remain exact anchors."
+        )
+        self.prevent_mask_drift_checkbox.toggled.connect(
+            lambda checked: settings_mgr.set_session_setting(
+                "prevent_mask_drift", checked
+            )
+        )
+        tracking_layout.addWidget(self.prevent_mask_drift_checkbox)
+
         # Directional tracking buttons - reuse the playback control icons.
         # The backward icon is the play icon mirrored horizontally in code (no extra asset needed).
         directional_layout = QHBoxLayout()
@@ -323,8 +359,10 @@ class SegmentationTab(QWidget):
         
         settings_mgr = get_settings_manager()
         slider_configs = [
-            ("Remove Holes:", 0, 200, 0, settings_mgr.get_session_setting("holes", 0), "holes",
-            "Fill enclosed holes up to strength² pixels (for example, 120 fills holes up to 14,400 px)."),
+            ("Remove Holes:", 0, 500, 0, settings_mgr.get_session_setting("holes", 0), "holes",
+            "Fill enclosed holes up to strength² pixels (for example, 400 fills holes up to 160,000 px on 4K footage)."),
+            ("Close Gaps:", 0, 150, 0, settings_mgr.get_session_setting("close_gaps", 0), "close_gaps",
+            "Bridge narrow cracks without expanding the outside silhouette; larger values help 4K masks."),
             ("Remove Dots:", 0, 200, 0, settings_mgr.get_session_setting("dots", 0), "dots",
             "Remove isolated regions up to strength² pixels while preserving retained edge opacity."),
             ("Border Fix:", 0, 10, 0, settings_mgr.get_session_setting("border_fix", 0), "border_fix",
@@ -493,9 +531,19 @@ class SegmentationTab(QWidget):
         model_index = self.sam_model_combo.findText(model)
         self.sam_model_combo.setCurrentIndex(model_index if model_index >= 0 else 0)
 
+        self.selected_object_only_checkbox.setChecked(
+            settings_mgr.get_session_setting(
+                "track_selected_object_only", True
+            )
+        )
+        self.prevent_mask_drift_checkbox.setChecked(
+            settings_mgr.get_session_setting("prevent_mask_drift", True)
+        )
+
         # Update sliders
         slider_mappings = [
             ("holes", self.holes_slider, self.holes_value),
+            ("close_gaps", self.close_gaps_slider, self.close_gaps_value),
             ("dots", self.dots_slider, self.dots_value),
             ("border_fix", self.border_fix_slider, self.border_fix_value),
             ("grow", self.grow_slider, self.grow_value)
@@ -1390,6 +1438,7 @@ class MainWindow(QMainWindow):
             # Connect postprocessing tab sliders
 
             seg_tab.holes_slider.valueChanged.connect(lambda _: self._update_current_frame_display())
+            seg_tab.close_gaps_slider.valueChanged.connect(lambda _: self._update_current_frame_display())
             seg_tab.dots_slider.valueChanged.connect(lambda _: self._update_current_frame_display())
             seg_tab.border_fix_slider.valueChanged.connect(lambda _: self._update_current_frame_display())
             seg_tab.grow_slider.valueChanged.connect(lambda _: self._update_current_frame_display())
@@ -2608,6 +2657,23 @@ class MainWindow(QMainWindow):
                 "Unload SAM to Free Memory"
             )
 
+    def _points_for_tracking(self):
+        """Return the prompt set requested by the Tracking controls."""
+        points = self.point_manager.get_all_points()
+        if not self.settings_mgr.get_session_setting(
+                "track_selected_object_only", True):
+            return points
+
+        object_id = self.segmentation_tab.get_selected_object_id()
+        selected_points = [
+            point for point in points if point["object_id"] == object_id
+        ]
+        print(
+            f"Tracking selected object {object_id} only "
+            f"({len(selected_points)} prompt points)"
+        )
+        return selected_points
+
     @monitored_operation("Tracking all frames")
     def track_objects(self):
         """Run object tracking using current points"""
@@ -2616,9 +2682,9 @@ class MainWindow(QMainWindow):
         if count > 0:
             self.sam_manager.deduplicated = False
             self.update_deduplicate_status()
-            self.sam_manager.replay_points(self.point_manager.get_all_points())
+            self.sam_manager.replay_points(self._points_for_tracking())
             if self.sam_manager.track_objects(parent_window=self) == 0: # if cancelled
-                self.sam_manager.replay_points(self.point_manager.get_all_points())
+                self.sam_manager.replay_points(self._points_for_tracking())
             else: # completed
                 pass
             sammie.remove_backup_mattes() # Make sure to remove an existing mattes backup folder
@@ -2638,10 +2704,10 @@ class MainWindow(QMainWindow):
         if count > 0:
             self.sam_manager.deduplicated = False
             self.update_deduplicate_status()
-            self.sam_manager.replay_points(self.point_manager.get_all_points())
+            self.sam_manager.replay_points(self._points_for_tracking())
             current_frame = self.frame_slider.value()
             if self.sam_manager.track_forward(parent_window=self, current_frame=current_frame) == 0: # if cancelled
-                self.sam_manager.replay_points(self.point_manager.get_all_points())
+                self.sam_manager.replay_points(self._points_for_tracking())
             sammie.remove_backup_mattes() # Make sure to remove an existing mattes backup folder
             self.update_tracking_status()
             self._update_current_frame_display()
@@ -2658,10 +2724,10 @@ class MainWindow(QMainWindow):
         if count > 0:
             self.sam_manager.deduplicated = False
             self.update_deduplicate_status()
-            self.sam_manager.replay_points(self.point_manager.get_all_points())
+            self.sam_manager.replay_points(self._points_for_tracking())
             current_frame = self.frame_slider.value()
             if self.sam_manager.track_backward(parent_window=self, current_frame=current_frame) == 0: # if cancelled
-                self.sam_manager.replay_points(self.point_manager.get_all_points())
+                self.sam_manager.replay_points(self._points_for_tracking())
             sammie.remove_backup_mattes() # Make sure to remove an existing mattes backup folder
             self.update_tracking_status()
             self._update_current_frame_display()

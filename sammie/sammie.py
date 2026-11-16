@@ -63,6 +63,73 @@ def _binary_mask_numpy(mask_logits) -> np.ndarray:
         binary = binary.numpy()
     return np.asarray(binary).squeeze().astype(np.uint8) * 255
 
+
+def _mask_motion_envelope(mask: np.ndarray, motion_radius: int) -> np.ndarray:
+    """Return a bounded-resolution dilation around a full-resolution mask."""
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    radius = max(0, int(motion_radius))
+    if radius == 0 or not np.any(binary):
+        return binary.astype(bool)
+
+    height, width = binary.shape
+    scale = max(1, int(np.ceil(max(height, width) / 960.0)))
+    small_width = max(1, int(np.ceil(width / scale)))
+    small_height = max(1, int(np.ceil(height / scale)))
+    small_mask = cv2.resize(
+        binary, (small_width, small_height), interpolation=cv2.INTER_AREA
+    ) > 0
+    small_radius = max(1, int(np.ceil(radius / scale)))
+    kernel_size = small_radius * 2 + 1
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+    )
+    small_envelope = cv2.dilate(
+        small_mask.astype(np.uint8), kernel, iterations=1
+    )
+    return cv2.resize(
+        small_envelope, (width, height), interpolation=cv2.INTER_NEAREST
+    ) > 0
+
+
+def _released_foreground_region(selected_mask: np.ndarray,
+                                previous_foreground: np.ndarray,
+                                current_foreground: np.ndarray,
+                                motion_radius: int) -> np.ndarray:
+    """Recover a stable region where a separately tracked occluder moved away."""
+    previous = np.asarray(previous_foreground) > 0
+    current = np.asarray(current_foreground) > 0
+    released = previous & ~current
+    nearby = _mask_motion_envelope(selected_mask, motion_radius)
+    return (released & nearby).astype(np.uint8) * 255
+
+
+def _stabilize_propagated_mask(predicted_mask: np.ndarray,
+                               previous_mask: np.ndarray,
+                               motion_radius: int) -> np.ndarray:
+    """Trim sudden growth outside the selected region's motion envelope.
+
+    If overlap is too small, the guard returns the model prediction intact. That
+    fail-open behavior lets cuts and unusually large motion recover instead of
+    erasing the object completely.
+    """
+    predicted = (np.asarray(predicted_mask) > 0).astype(np.uint8)
+    previous = (np.asarray(previous_mask) > 0).astype(np.uint8)
+    if not np.any(predicted) or not np.any(previous):
+        return predicted * 255
+
+    envelope = _mask_motion_envelope(previous, motion_radius)
+    stabilized = predicted & envelope
+
+    # A poor overlap signals a cut or fast motion.  Keep the model result so the
+    # tracker can recover rather than replacing the object with an empty mask.
+    kept_fraction = np.count_nonzero(stabilized) / max(
+        1, np.count_nonzero(predicted)
+    )
+    if kept_fraction < 0.35:
+        return predicted * 255
+
+    return stabilized.astype(np.uint8) * 255
+
 # .........................................................................................
 # SAM2 segmentation
 # .........................................................................................
@@ -453,6 +520,84 @@ class SamManager(core.CallbackMixin):
 
         self._notify('replay_complete')
 
+    @_segmentation_inference_context
+    def replace_frame_object_points(self, frame_number, object_id, points_list):
+        """Replace one frame/object prompt group without replaying the project."""
+        input_points = np.asarray(
+            [(point['x'], point['y']) for point in points_list],
+            dtype=np.float32,
+        ).reshape(-1, 2)
+        input_labels = np.asarray(
+            [1 if point['positive'] else 0 for point in points_list],
+            dtype=np.int32,
+        )
+
+        replace_hook = getattr(self.predictor, "replace_points_in_frame", None)
+        if replace_hook is not None:
+            result = replace_hook(
+                self.inference_state,
+                frame_number,
+                object_id,
+                input_points,
+                input_labels,
+            )
+        else:
+            result = self._replace_generic_frame_object_points(
+                frame_number, object_id, input_points, input_labels
+            )
+
+        out_obj_ids = []
+        if result is not None:
+            _, out_obj_ids, out_mask_logits = result
+            if len(input_labels):
+                for index, out_obj_id in enumerate(out_obj_ids):
+                    if out_obj_id != object_id:
+                        continue
+                    mask_filename = os.path.join(
+                        core.mask_dir,
+                        f"{frame_number:05d}",
+                        f"{out_obj_id}.png",
+                    )
+                    mask = _binary_mask_numpy(out_mask_logits[index])
+                    os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
+                    cv2.imwrite(mask_filename, mask)
+
+        self._notify(
+            'segmentation_complete',
+            frame=frame_number,
+            object_id=object_id,
+            out_obj_ids=out_obj_ids,
+        )
+
+    def _replace_generic_frame_object_points(
+            self, frame_number, object_id, input_points, input_labels):
+        """Targeted prompt replacement for SAM 2/2.1 predictor state."""
+        state = self.inference_state
+        obj_idx = state.get("obj_id_to_idx", {}).get(object_id)
+        if obj_idx is not None:
+            self.predictor.clear_all_prompts_in_frame(
+                state, frame_number, object_id, need_output=False
+            )
+            for collection_name in (
+                    "output_dict_per_obj", "temp_output_dict_per_obj"):
+                output_dict = state.get(collection_name, {}).get(obj_idx, {})
+                output_dict.get("cond_frame_outputs", {}).pop(frame_number, None)
+                output_dict.get("non_cond_frame_outputs", {}).pop(frame_number, None)
+            state.get("frames_tracked_per_obj", {}).get(obj_idx, {}).pop(
+                frame_number, None
+            )
+
+        if not len(input_labels):
+            return None
+        return self.predictor.add_new_points_or_box(
+            inference_state=state,
+            frame_idx=frame_number,
+            obj_id=object_id,
+            points=input_points,
+            labels=input_labels,
+            clear_old_points=True,
+        )
+
 
     @_segmentation_inference_context
     def _propagate(self, parent_window, start_frame_idx, max_frame_num_to_track, reverse=False,
@@ -486,13 +631,80 @@ class SamManager(core.CallbackMixin):
 
         last_frame_idx = None
         cancelled = False
+        selected_object_id = settings_mgr.get_session_setting(
+            "selected_object_id", None
+        )
+        selected_only = settings_mgr.get_session_setting(
+            "track_selected_object_only", True
+        )
+        prevent_drift = settings_mgr.get_session_setting(
+            "prevent_mask_drift", True
+        )
+        previous_masks = {}
+        video_size = max(
+            int(getattr(core.VideoInfo, "width", 0) or 0),
+            int(getattr(core.VideoInfo, "height", 0) or 0),
+            1,
+        )
+        motion_radius = max(4, int(round(video_size * 0.02)))
+        previous_foreground = None
 
         for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(
                 self.inference_state, start_frame_idx=start_frame_idx,
                 max_frame_num_to_track=max_frame_num_to_track, reverse=reverse):
             for i, out_obj_id in enumerate(out_obj_ids):
+                if (selected_only and selected_object_id is not None
+                        and out_obj_id != selected_object_id):
+                    continue
                 mask_filename = os.path.join(core.mask_dir, f"{out_frame_idx:05d}", f"{out_obj_id}.png")
                 mask = _binary_mask_numpy(out_mask_logits[i])
+
+                obj_idx = self.inference_state.get(
+                    "obj_id_to_idx", {}
+                ).get(out_obj_id)
+                point_inputs = self.inference_state.get(
+                    "point_inputs_per_obj", {}
+                ).get(obj_idx, {}) if obj_idx is not None else {}
+                is_prompt_anchor = out_frame_idx in point_inputs
+                previous = previous_masks.get(out_obj_id)
+                if (prevent_drift and out_obj_id == selected_object_id
+                        and previous is not None and not is_prompt_anchor):
+                    mask = _stabilize_propagated_mask(
+                        mask, previous, motion_radius
+                    )
+
+                if (prevent_drift and out_obj_id == selected_object_id):
+                    # Preserve an opening/background region while respecting
+                    # separately tracked foreground objects.  This makes a
+                    # locked window mask follow around people instead of
+                    # painting over them as the prior shape is retained.
+                    frame_mask_dir = os.path.dirname(mask_filename)
+                    current_foreground = np.zeros_like(mask, dtype=np.uint8)
+                    for other_filename in glob.glob(
+                            os.path.join(frame_mask_dir, "*.png")):
+                        try:
+                            other_id = int(os.path.splitext(
+                                os.path.basename(other_filename)
+                            )[0])
+                        except ValueError:
+                            continue
+                        if other_id == out_obj_id:
+                            continue
+                        other_mask = cv2.imread(
+                            other_filename, cv2.IMREAD_GRAYSCALE
+                        )
+                        if other_mask is not None and other_mask.shape == mask.shape:
+                            current_foreground[other_mask > 0] = 255
+                    if previous is not None and previous_foreground is not None:
+                        mask |= _released_foreground_region(
+                            previous,
+                            previous_foreground,
+                            current_foreground,
+                            motion_radius,
+                        )
+                    mask[current_foreground > 0] = 0
+                    previous_foreground = current_foreground
+                previous_masks[out_obj_id] = mask
                 os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
                 cv2.imwrite(mask_filename, mask)
 
@@ -519,6 +731,16 @@ class SamManager(core.CallbackMixin):
                 progress_dialog.close()
             else:
                 progress_dialog.setValue(100)
+
+        # MLX can retain temporary graph allocations from the last inference
+        # frame until the next periodic cache sweep. Release those immediately
+        # when a tracking run ends so memory pressure drops while the user
+        # reviews or edits the result. Temporal state needed for corrections is
+        # kept in inference_state and is not affected by clearing this cache.
+        if is_mlx_sam21_model(self.loaded_model_name):
+            clear_mlx_cache()
+        elif is_mlx_sam31_model(self.loaded_model_name):
+            clear_mlx_sam31_cache()
 
         # Always leave the slider showing the last frame actually processed
         if last_frame_idx is not None:

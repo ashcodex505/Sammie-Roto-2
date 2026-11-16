@@ -134,9 +134,12 @@ class SessionSettings:
     # Segmentation parameters
     sam_model: str = field(default_factory=_default_segmentation_model)
     holes: int = 0
+    close_gaps: int = 0
     dots: int = 0
     border_fix: int = 0
     grow: int = 0
+    track_selected_object_only: bool = True
+    prevent_mask_drift: bool = True
     
     # MatAnyone parameters
     matany_grow: int = 0

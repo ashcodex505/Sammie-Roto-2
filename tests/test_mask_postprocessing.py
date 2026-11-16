@@ -2,10 +2,21 @@ import cv2
 import numpy as np
 import unittest
 
-from sammie.core import fill_small_holes, remove_small_dots
+from sammie.core import close_mask_gaps, fill_small_holes, remove_small_dots
 
 
 class MaskPostprocessingTests(unittest.TestCase):
+    def test_close_mask_gaps_bridges_narrow_cracks_without_growing_outer_edges(self):
+        mask = np.zeros((120, 180), dtype=np.uint8)
+        mask[20:100, 20:88] = 255
+        mask[20:100, 94:160] = 255
+
+        closed = close_mask_gaps(mask, 8)
+
+        self.assertEqual(closed[60, 91], 255)
+        self.assertEqual(closed[60, 15], 0)
+        self.assertEqual(closed[15, 60], 0)
+
     def test_fill_small_holes_uses_exact_pixel_area_and_extended_strength(self):
         mask = np.zeros((300, 300), dtype=np.uint8)
         mask[20:280, 20:280] = 255

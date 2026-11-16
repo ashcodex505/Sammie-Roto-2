@@ -524,6 +524,9 @@ def apply_mask_postprocessing(mask):
 
     if holes > 0:
         mask = fill_small_holes(mask, holes)
+    close_gaps = settings_mgr.get_session_setting("close_gaps", 0)
+    if close_gaps > 0:
+        mask = close_mask_gaps(mask, close_gaps)
     if dots > 0:
         mask = remove_small_dots(mask, dots)
     if border_fix > 0:
@@ -532,6 +535,38 @@ def apply_mask_postprocessing(mask):
         mask = grow_shrink(mask, grow)
 
     return mask
+
+
+def close_mask_gaps(mask, gap_value):
+    """Bridge narrow cracks between adjacent mask regions without expanding the silhouette."""
+    if gap_value <= 0:
+        return mask
+
+    height, width = mask.shape[:2]
+    scale = max(1, int(np.ceil(max(height, width) / 960.0)))
+    small_width = max(1, int(np.ceil(width / scale)))
+    small_height = max(1, int(np.ceil(height / scale)))
+    foreground = (mask > 0).astype(np.uint8)
+    small_foreground = cv2.resize(
+        foreground,
+        (small_width, small_height),
+        interpolation=cv2.INTER_AREA,
+    ) > 0
+    small_radius = max(1, int(np.ceil(gap_value / scale)))
+    kernel_size = small_radius * 2 + 1
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+    )
+    small_closed = cv2.morphologyEx(
+        small_foreground.astype(np.uint8), cv2.MORPH_CLOSE, kernel
+    )
+    closed = cv2.resize(
+        small_closed, (width, height), interpolation=cv2.INTER_NEAREST
+    )
+
+    result = mask.copy()
+    result[(closed > 0) & (foreground == 0)] = 255
+    return result
 
 
 def apply_matany_postprocessing(mask):

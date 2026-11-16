@@ -86,6 +86,25 @@ class ExportPathManager:
     def check_existing_files(self, paths: list) -> list:
         """Check which files already exist"""
         return [p for p in paths if os.path.exists(p)]
+
+    @staticmethod
+    def get_write_error(path: str):
+        """Return a helpful error when an existing output cannot be overwritten."""
+        if not os.path.exists(path):
+            return None
+
+        try:
+            file_descriptor = os.open(path, os.O_WRONLY)
+        except PermissionError:
+            return (
+                f"'{os.path.basename(path)}' cannot be overwritten. It is likely open "
+                "in another application. Close the file there or choose a new filename."
+            )
+        except OSError as exc:
+            return f"'{os.path.basename(path)}' cannot be overwritten: {exc}"
+        else:
+            os.close(file_descriptor)
+            return None
     
     @staticmethod
     def _sanitize_name(name: str) -> str:
@@ -584,6 +603,18 @@ class ExportDialog(QDialog):
             # For video, check file existence
             existing = self.path_manager.check_existing_files(output_paths)
             if existing:
+                write_errors = [
+                    error for path in existing
+                    if (error := self.path_manager.get_write_error(path))
+                ]
+                if write_errors:
+                    show_message_dialog(
+                        self,
+                        title="Output File Is In Use",
+                        message="\n\n".join(write_errors),
+                        type="warning"
+                    )
+                    return False
                 return self._confirm_overwrite_files(existing)
         
         return True

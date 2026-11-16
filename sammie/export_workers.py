@@ -98,6 +98,13 @@ class VideoExportWorker(BaseExportWorker):
         except InterruptedError as e:
             # User cancelled - emit with cancel message
             self.finished.emit(False, str(e))
+        except PermissionError as e:
+            output_name = os.path.basename(getattr(e, "filename", "") or self.output_paths[0])
+            self.finished.emit(
+                False,
+                f"Export could not write '{output_name}'. The file may be open in "
+                "another application. Close it there or export with a new filename."
+            )
         except Exception as e:
             import traceback
             tb = traceback.format_exc()
