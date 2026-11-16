@@ -22,16 +22,9 @@ macos = [
     "torchvision==0.29.0 ; sys_platform == 'darwin'",
     "mlx>=0.31.2 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "huggingface-hub[hf_xet]>=0.36 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "mlx-vlm>=0.7.8,<0.8 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "safetensors>=0.5 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "pillow>=11.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "psutil>=7.1 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
-]
-sam31 = [
-    "mlx>=0.32.4 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "mlx-vlm>=0.7.8,<0.8 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "huggingface-hub[hf_xet]>=0.36 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "psutil>=7.1",
 ]
 cpu   = ["torch==2.11.0", "torchvision==0.26.0"]
 cu126 = ["torch==2.11.0", "torchvision==0.26.0"]

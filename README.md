@@ -46,13 +46,6 @@ under `checkpoints/`; the original official checkpoint remains the source of
 truth. The existing PyTorch **Base** and **Anime** models remain
 available.
 
-**SAM 3.1 MLX** replaces the retired SAM 2.1 Large option on Apple Silicon.
-It runs at SAM 3.1's native 1008-pixel tracker resolution, supports Sammie's
-existing positive/negative point workflow, later-frame corrections, multiple
-objects, and forward/reverse propagation. The adapter lazily reads frames,
-retains only one frame's model features, and uses SAM 3.1's bounded temporal
-memory so long clips do not preload the full video into unified memory.
-
 For a Git clone, initialize the pinned MLX runtime with
 `git submodule update --init --recursive`. The installer performs the equivalent
 exact-commit download automatically for release archives.
@@ -84,8 +77,6 @@ If you want to remove the application, simply delete the Sammie-Roto folder. Sho
 
 ### Acknowledgements
 * [SAM 2](https://github.com/facebookresearch/sam2)
-* [SAM 3.1](https://huggingface.co/facebook/sam3.1) and
-  [MLX Community](https://huggingface.co/mlx-community/sam3.1-bf16)
 * [sam2-mlx](https://github.com/avbiswas/sam2-mlx) (Apple MLX runtime)
 * [MatAnyone](https://github.com/pq-yang/MatAnyone) & [MatAnyone2](https://github.com/pq-yang/MatAnyone2)
 * [Wan2GP](https://github.com/deepbeepmeep/Wan2GP) (for optimized MatAnyone code)

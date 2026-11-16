@@ -24,15 +24,10 @@ from sammie.gui_widgets import show_message_dialog
 from sammie.model_downloader import ensure_models
 from sammie.segmentation import (
     MLX_MODEL_NAME,
-    SAM31_MODEL_NAME,
     build_mlx_sam21_predictor,
-    build_mlx_sam31_predictor,
     is_mlx_sam21_model,
-    is_mlx_sam31_model,
-    sam31_checkpoint_ready,
 )
 from sammie.segmentation.mlx_sam21 import clear_mlx_cache
-from sammie.segmentation.mlx_sam31 import clear_mlx_sam31_cache
 
 smoothing_model = None  # global variable needed to avoid complexity of passing the model around
 
@@ -42,8 +37,7 @@ def _segmentation_inference_context(function):
 
     @wraps(function)
     def wrapped(manager, *args, **kwargs):
-        if (is_mlx_sam21_model(manager.loaded_model_name)
-                or is_mlx_sam31_model(manager.loaded_model_name)):
+        if is_mlx_sam21_model(manager.loaded_model_name):
             return function(manager, *args, **kwargs)
         with core.DeviceManager.inference_context():
             return function(manager, *args, **kwargs)
@@ -155,28 +149,9 @@ class SamManager(core.CallbackMixin):
             print("EfficientTAM is no longer available; using SAM2 Base instead")
             sam_model = "Base"
         elif sam_model == "Large":
-            print("SAM2 Large was replaced by SAM 3.1 MLX")
-            sam_model = SAM31_MODEL_NAME
+            print(f"{sam_model} is no longer available; using SAM 2.1 Base+ MLX FP16")
+            sam_model = MLX_MODEL_NAME
         core.DeviceManager.clear_cache()
-        if is_mlx_sam31_model(sam_model):
-            if not sam31_checkpoint_ready():
-                show_message_dialog(
-                    parent_window,
-                    "SAM 3.1 checkpoint missing",
-                    "Download mlx-community/sam3.1-bf16 into "
-                    "checkpoints/sam3.1-mlx-bf16 before loading this model.",
-                    type="error",
-                )
-                return False
-            settings_mgr = get_settings_manager()
-            self.predictor = build_mlx_sam31_predictor(
-                cache_limit_mib=settings_mgr.get_app_setting("mlx_cache_limit_mib", 256),
-                memory_limit_mib=settings_mgr.get_app_setting("sam31_memory_limit_mib", 10240),
-                feature_cache_size=settings_mgr.get_app_setting("sam31_feature_cache_size", 3),
-            )
-            self.loaded_model_name = sam_model
-            print("Loaded SAM 3.1 MLX model (1008px)")
-            return True
         if is_mlx_sam21_model(sam_model):
             if not ensure_models("Base", parent=parent_window):
                 return False
@@ -211,9 +186,7 @@ class SamManager(core.CallbackMixin):
 
     def unload_segmentation_model(self):
         """Unload the SAM model and clear cache"""
-        was_mlx21 = is_mlx_sam21_model(self.loaded_model_name)
-        was_mlx31 = is_mlx_sam31_model(self.loaded_model_name)
-        was_mlx = was_mlx21 or was_mlx31
+        was_mlx = is_mlx_sam21_model(self.loaded_model_name)
         if was_mlx and self.predictor is not None:
             release = getattr(self.predictor, "release", None)
             if release is not None:
@@ -222,20 +195,15 @@ class SamManager(core.CallbackMixin):
         self.inference_state = None
         self.loaded_model_name = None
         gc.collect()
-        if was_mlx21:
+        if was_mlx:
             clear_mlx_cache()
-        elif was_mlx31:
-            clear_mlx_sam31_cache()
         core.DeviceManager.clear_cache()
         print("Unloaded Segmentation model")
 
     def offload_model_to_cpu(self):
         """Offload SAM2 model to CPU to free VRAM"""
-        if is_mlx_sam21_model(self.loaded_model_name) or is_mlx_sam31_model(self.loaded_model_name):
-            if is_mlx_sam21_model(self.loaded_model_name):
-                clear_mlx_cache()
-            else:
-                clear_mlx_sam31_cache()
+        if is_mlx_sam21_model(self.loaded_model_name):
+            clear_mlx_cache()
             return
         device = core.DeviceManager.get_device()
         if device.type == 'cpu':
@@ -247,7 +215,7 @@ class SamManager(core.CallbackMixin):
 
     def load_model_to_device(self):
         """Load SAM2 model back to the active device"""
-        if is_mlx_sam21_model(self.loaded_model_name) or is_mlx_sam31_model(self.loaded_model_name):
+        if is_mlx_sam21_model(self.loaded_model_name):
             return
         device = core.DeviceManager.get_device()
         if device.type == 'cpu':
@@ -739,8 +707,6 @@ class SamManager(core.CallbackMixin):
         # kept in inference_state and is not affected by clearing this cache.
         if is_mlx_sam21_model(self.loaded_model_name):
             clear_mlx_cache()
-        elif is_mlx_sam31_model(self.loaded_model_name):
-            clear_mlx_sam31_cache()
 
         # Always leave the slider showing the last frame actually processed
         if last_frame_idx is not None:

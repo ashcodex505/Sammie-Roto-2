@@ -83,12 +83,6 @@ class ApplicationSettings:
     mlx_memory_limit_mib: int = 6144
     mlx_frame_cache_size: int = 3
     mlx_state_window: int = 16
-    # Cache a few full-quality feature frames so corrections on nearby frames
-    # avoid repeating the ~2.4-second visual backbone pass. Each extra entry is
-    # roughly 40-80 MiB on the current SAM 3.1 model.
-    sam31_memory_limit_mib: int = 10240
-    sam31_feature_cache_size: int = 3
-    
     # Deduplication
     dedupe_threshold: float = 0.8
     

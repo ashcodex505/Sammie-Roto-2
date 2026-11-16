@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import (
     QAction, QShortcut, QKeySequence, QTextCursor, QIcon, QPixmap, QFont, QDesktopServices
 )
-from PySide6.QtCore import Qt, QThread, QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl
 
 # Import external logic functions
 from sammie import sammie
@@ -59,28 +59,6 @@ def monitored_operation(name):
         return wrapper
     return decorator
 
-
-class SegmentationModelLoadWorker(QThread):
-    """Load and initialize an MLX model without blocking Qt's event loop."""
-
-    def __init__(self, manager, model_name, parent=None):
-        super().__init__(parent)
-        self.manager = manager
-        self.model_name = model_name
-        self.succeeded = False
-        self.error = None
-
-    def run(self):
-        try:
-            self.manager.unload_segmentation_model()
-            self.succeeded = self.manager.load_segmentation_model(
-                self.model_name, parent_window=None
-            )
-            if self.succeeded:
-                self.manager.initialize_predictor()
-        except Exception as error:
-            self.error = error
-            self.succeeded = False
 
 # ==================== LOGGING HELPER ====================
 
@@ -220,11 +198,10 @@ class SegmentationTab(QWidget):
         self.sam_model_combo = QComboBox()
         model_choices = ["Base", "Anime"]
         if platform.system() == "Darwin" and platform.machine() == "arm64":
-            model_choices[0:0] = ["Base+ MLX FP16", "SAM 3.1 MLX"]
+            model_choices.insert(0, "Base+ MLX FP16")
         self.sam_model_combo.addItems(model_choices)
         self.sam_model_combo.setToolTip(
-            "Base+ MLX FP16 uses native Apple Silicon execution at 1024px.\n"
-            "SAM 3.1 MLX uses 1008px Object Multiplex tracking."
+            "Base+ MLX FP16 uses native Apple Silicon execution at 1024px."
         )
         self.sam_model_btn = QPushButton("Load Model")
         self.sam_model_btn.setEnabled(False) # disabled until video is loaded
@@ -527,7 +504,7 @@ class SegmentationTab(QWidget):
         
         model = settings_mgr.get_session_setting("sam_model", "Base")
         if model == "Large":
-            model = "SAM 3.1 MLX"
+            model = "Base+ MLX FP16"
         model_index = self.sam_model_combo.findText(model)
         self.sam_model_combo.setCurrentIndex(model_index if model_index >= 0 else 0)
 
@@ -2568,37 +2545,6 @@ class MainWindow(QMainWindow):
             print("Model is already loaded")
             return
 
-        if model == "SAM 3.1 MLX":
-            active_worker = getattr(self, "_segmentation_load_worker", None)
-            if active_worker is not None and active_worker.isRunning():
-                print("A segmentation model is already loading")
-                return
-            if not sammie.sam31_checkpoint_ready():
-                show_message_dialog(
-                    self,
-                    title="SAM 3.1 checkpoint missing",
-                    message="Download mlx-community/sam3.1-bf16 into "
-                            "checkpoints/sam3.1-mlx-bf16 first.",
-                    type="error",
-                )
-                return
-
-            self._segmentation_load_progress = QProgressDialog(
-                "Loading SAM 3.1 MLX...", None, 0, 0, self
-            )
-            self._segmentation_load_progress.setWindowTitle("Please Wait")
-            self._segmentation_load_progress.setModal(True)
-            self._segmentation_load_progress.show()
-            self.segmentation_tab.sam_model_btn.setEnabled(False)
-            self._begin_operation("Loading SAM 3.1 MLX")
-            worker = SegmentationModelLoadWorker(
-                self.sam_manager, model, parent=self
-            )
-            self._segmentation_load_worker = worker
-            worker.finished.connect(self._finish_segmentation_model_load)
-            worker.start()
-            return
-
         progress = QProgressDialog("Loading...", None, 0, 0, self)
         progress.setWindowTitle("Please Wait")
         progress.setModal(True)
@@ -2618,35 +2564,6 @@ class MainWindow(QMainWindow):
             print("Failed to load segmentation model")
 
         progress.close()
-        self._end_operation()
-
-    def _finish_segmentation_model_load(self):
-        """Finish the background SAM 3.1 load on Qt's main thread."""
-        worker = self._segmentation_load_worker
-        progress = self._segmentation_load_progress
-        progress.close()
-        self.segmentation_tab.sam_model_btn.setEnabled(True)
-
-        if worker.succeeded:
-            model = worker.model_name
-            settings_mgr = get_settings_manager()
-            settings_mgr.set_session_setting("sam_model", model)
-            settings_mgr.set_app_setting("default_sam_model", model)
-            self._mark_segmentation_model_loaded()
-            print(f"{model} is ready")
-        else:
-            message = str(worker.error) if worker.error else "Unknown loading error"
-            print(f"Failed to load segmentation model: {message}")
-            show_message_dialog(
-                self,
-                title="Could Not Load SAM 3.1",
-                message=message,
-                type="error",
-            )
-
-        worker.deleteLater()
-        self._segmentation_load_worker = None
-        self._segmentation_load_progress = None
         self._end_operation()
 
     def _mark_segmentation_model_loaded(self):

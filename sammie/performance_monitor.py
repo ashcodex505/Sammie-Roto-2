@@ -291,7 +291,7 @@ class PerformanceMonitorWindow(QDialog):
         self.trace_view = QPlainTextEdit()
         self.trace_view.setReadOnly(True)
         self.trace_view.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.trace_view.setPlaceholderText("Run SAM 3.1 with this window open to capture calls.")
+        self.trace_view.setPlaceholderText("Run SAM tracking with this window open to capture calls.")
         trace_layout.addWidget(self.trace_view, 1)
 
         trace_buttons = QHBoxLayout()

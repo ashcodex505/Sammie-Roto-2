@@ -36,7 +36,7 @@ class SamManagerReplayTests(unittest.TestCase):
         manager = SamManager()
         manager.predictor = _FakePredictor()
         manager.inference_state = {"state": True}
-        manager.loaded_model_name = "SAM 3.1 MLX"
+        manager.loaded_model_name = "Base+ MLX FP16"
         return manager
 
     @patch("sammie.sammie.cv2.imwrite", return_value=True)

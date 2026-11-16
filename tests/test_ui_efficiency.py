@@ -57,7 +57,7 @@ class UnloadSegmentationControlTests(unittest.TestCase):
 
         class FakeManager:
             predictor = object()
-            loaded_model_name = "SAM 3.1 MLX"
+            loaded_model_name = "Base+ MLX FP16"
 
             def __init__(self):
                 self.unloaded = False
